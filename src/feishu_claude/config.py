@@ -17,6 +17,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     # Feishu Configuration
@@ -28,11 +29,20 @@ class Settings(BaseSettings):
     )
     feishu_allow_user_ids: str = Field(default="", alias="FEISHU_ALLOW_USER_IDS")
     feishu_allow_group_chats: bool = Field(default=True, alias="FEISHU_ALLOW_GROUP_CHATS")
+    feishu_backend: Literal["claude", "codex"] = Field(default="claude", alias="FEISHU_BACKEND")
 
     # Claude Configuration
     claude_workspace: Path = Field(default=Path("."), alias="CLAUDE_WORKSPACE")
     claude_model: str | None = Field(default=None, alias="CLAUDE_MODEL")
     claude_max_turns: int | None = Field(default=None, alias="CLAUDE_MAX_TURNS")
+
+    # Codex Configuration
+    codex_workspace: Path | None = Field(default=None, alias="CODEX_WORKSPACE")
+    codex_model: str | None = Field(default=None, alias="CODEX_MODEL")
+    codex_search_enabled: bool = Field(default=False, alias="CODEX_SEARCH_ENABLED")
+    codex_default_mode: Literal["safe", "normal", "full"] = Field(
+        default="safe", alias="CODEX_DEFAULT_MODE"
+    )
 
     @field_validator("feishu_allow_user_ids", mode="before")
     @classmethod
@@ -57,6 +67,11 @@ class Settings(BaseSettings):
         if not self.feishu_app_secret:
             errors.append("FEISHU_APP_SECRET is required")
         return errors
+
+    @property
+    def effective_codex_workspace(self) -> Path:
+        """Return codex workspace, defaulting to Claude workspace/current directory."""
+        return self.codex_workspace or self.claude_workspace
 
 
 @lru_cache

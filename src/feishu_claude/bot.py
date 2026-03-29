@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .claude_runner import ClaudeRunner, ClaudeSession
 from .config import Settings, get_settings
+from .codex_runner import CodexRunner
 from .feishu_adapter import FeishuAdapter, FeishuConfig, FeishuMessage
 
 logger = logging.getLogger("feishu_claude")
@@ -40,6 +41,13 @@ class FeishuClaudeBot:
             model=self.settings.claude_model,
             max_turns=self.settings.claude_max_turns,
         )
+        self.codex = CodexRunner(
+            workspace=self.settings.effective_codex_workspace,
+            model=self.settings.codex_model,
+            search_enabled=self.settings.codex_search_enabled,
+            mode=self.settings.codex_default_mode,
+        )
+        self.backend = self.settings.feishu_backend
 
         # Session management
         self._sessions: dict[str, ClaudeSession] = {}
@@ -54,11 +62,11 @@ class FeishuClaudeBot:
         if errors:
             raise ValueError("Configuration errors: " + "; ".join(errors))
 
-        # Check Claude CLI availability
-        available, info = ClaudeRunner.check_cli_available()
+        runner_name, runner = self._selected_backend_runner()
+        available, info = runner.check_cli_available()
         if not available:
-            raise RuntimeError(f"Claude Code CLI not available: {info}")
-        logger.info(f"Claude Code CLI found at: {info}")
+            raise RuntimeError(f"{runner_name} CLI not available: {info}")
+        logger.info(f"{runner_name} CLI found at: {info}")
 
         # Start Feishu adapter
         await self.feishu.start()
@@ -81,21 +89,22 @@ class FeishuClaudeBot:
 
         # Forward to Claude
         try:
-            claude_response = await self.claude.send_message(
+            _, runner = self._selected_backend_runner()
+            backend_response = await runner.send_message(
                 chat_id=msg.chat_id,
                 message=msg.content,
                 continue_session=True,
             )
 
-            if claude_response.is_error:
-                logger.error(f"Claude error: {claude_response.content}")
+            if backend_response.is_error:
+                logger.error(f"Runner error: {backend_response.content}")
                 await self.feishu.send_message(
                     msg.chat_id,
-                    f"❌ {claude_response.content}",
+                    f"❌ {backend_response.content}",
                 )
             else:
-                # Send Claude's response
-                await self.feishu.send_message(msg.chat_id, claude_response.content)
+                # Send backend response
+                await self.feishu.send_message(msg.chat_id, backend_response.content)
 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
@@ -117,11 +126,13 @@ class FeishuClaudeBot:
             return self._help_text()
 
         if cmd == "/new":
-            self.claude.reset_session(msg.chat_id)
+            _, runner = self._selected_backend_runner()
+            runner.reset_session(msg.chat_id)
             return "✨ Started a new conversation session."
 
         if cmd == "/sessions":
-            sessions = self.claude.list_sessions()
+            _, runner = self._selected_backend_runner()
+            sessions = runner.list_sessions()
             if not sessions:
                 return "No active sessions."
             lines = ["Active sessions:"]
@@ -131,14 +142,16 @@ class FeishuClaudeBot:
             return "\n".join(lines)
 
         if cmd == "/status":
-            available, info = ClaudeRunner.check_cli_available()
+            runner_name, runner = self._selected_backend_runner()
+            available, info = runner.check_cli_available()
             status = "✅" if available else "❌"
             return (
                 f"🤖 FeishuClaude Status\n"
-                f"Claude CLI: {status} {info}\n"
+                f"Backend: {self.backend}\n"
+                f"{runner_name} CLI: {status} {info}\n"
                 f"Workspace: {self.workspace}\n"
-                f"Model: {self.settings.claude_model or 'default'}\n"
-                f"Active sessions: {len(self.claude.list_sessions())}"
+                f"Model: {self._current_model_name()}\n"
+                f"Active sessions: {len(runner.list_sessions())}"
             )
 
         if cmd == "/ping":
@@ -172,3 +185,19 @@ class FeishuClaudeBot:
             pass
         finally:
             await self.stop()
+
+    def _selected_backend_runner(self) -> tuple[str, ClaudeRunner | CodexRunner]:
+        """Get the currently selected backend runner.
+
+        Returns:
+            Tuple of display name and runner instance.
+        """
+        if self.backend == "codex":
+            return "Codex", self.codex
+        return "Claude", self.claude
+
+    def _current_model_name(self) -> str:
+        """Get configured model for current backend."""
+        if self.backend == "codex":
+            return self.settings.codex_model or "default"
+        return self.settings.claude_model or "default"

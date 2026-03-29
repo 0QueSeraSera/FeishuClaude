@@ -6,6 +6,7 @@ Connect Feishu bot to local Claude Code CLI for interactive AI conversations.
 
 - **Real-time chat**: Receive and respond to Feishu messages via WebSocket (long-connection)
 - **Claude Code integration**: Use Claude Code CLI as the backend AI engine
+- **Backend switch**: Select `claude` or `codex` backend with `FEISHU_BACKEND`
 - **Session management**: Maintain conversation context per chat
 - **Command support**: Built-in commands for session management
 
@@ -43,9 +44,12 @@ Connect Feishu bot to local Claude Code CLI for interactive AI conversations.
 | `FEISHU_APP_ID` | Feishu app ID | Yes |
 | `FEISHU_APP_SECRET` | Feishu app secret | Yes |
 | `FEISHU_CONNECTION_MODE` | `long_connection` or `webhook` | No (default: long_connection) |
+| `FEISHU_BACKEND` | `claude` or `codex` | No (default: claude) |
 | `FEISHU_ALLOW_USER_IDS` | Comma-separated allowed user IDs | No (allow all) |
 | `FEISHU_ALLOW_GROUP_CHATS` | Allow group chats | No (default: true) |
 | `CLAUDE_WORKSPACE` | Working directory for Claude | No (default: current dir) |
+| `CODEX_WORKSPACE` | Working directory for Codex | No (default: CLAUDE_WORKSPACE) |
+| `CODEX_MODEL` | Codex model override | No |
 
 ## Commands
 
