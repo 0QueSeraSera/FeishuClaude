@@ -203,3 +203,66 @@ async def test_codex_send_message_error(monkeypatch: pytest.MonkeyPatch):
     response = await runner.send_message("chat_1", "hello")
     assert response.is_error is True
     assert "permission denied" in response.content
+
+
+@pytest.mark.asyncio
+async def test_codex_send_message_parses_nested_response_payload(monkeypatch: pytest.MonkeyPatch):
+    """Runner should extract final text from nested response-completed schema."""
+    stdout = (
+        '{"type":"turn.started"}\n'
+        '{"type":"response.completed","response":{"output":[{"type":"message","role":"assistant",'
+        '"content":[{"type":"output_text","text":"Nested hello"}]}]}}\n'
+    ).encode("utf-8")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return _FakeProcess(returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    runner = CodexRunner()
+    response = await runner.send_message("chat_nested", "hello")
+
+    assert response.is_error is False
+    assert response.content == "Nested hello"
+
+
+@pytest.mark.asyncio
+async def test_codex_send_message_uses_friendly_fallback_when_no_final_text(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Runner should never expose raw JSONL output as user-facing final content."""
+    stdout = (
+        '{"type":"thread.started","thread_id":"th_1"}\n'
+        '{"type":"turn.completed"}\n'
+    ).encode("utf-8")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return _FakeProcess(returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    runner = CodexRunner()
+    response = await runner.send_message("chat_empty", "hello")
+
+    assert response.is_error is False
+    assert response.content == "Codex run completed without a final assistant message."
+    assert '{"type":"thread.started"' in response.raw_output
+
+
+@pytest.mark.asyncio
+async def test_codex_send_message_ignores_tool_metadata_as_final_text(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Tool lifecycle metadata should not be promoted to final assistant content."""
+    stdout = (
+        '{"type":"tool.call.started","tool_name":"exec_command","message":"running"}\n'
+        '{"type":"tool.call.completed","tool_name":"exec_command","message":"exit_code=0"}\n'
+    ).encode("utf-8")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return _FakeProcess(returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    runner = CodexRunner()
+    response = await runner.send_message("chat_tool_only", "hello")
+
+    assert response.is_error is False
+    assert response.content == "Codex run completed without a final assistant message."

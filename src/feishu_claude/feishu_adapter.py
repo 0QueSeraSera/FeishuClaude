@@ -109,6 +109,15 @@ class FeishuAdapter:
             errors.append("FEISHU_APP_ID is required")
         if not self.config.app_secret:
             errors.append("FEISHU_APP_SECRET is required")
+        if self.config.connection_mode == "webhook":
+            errors.append(
+                "FEISHU_CONNECTION_MODE=webhook is not implemented yet; "
+                "use FEISHU_CONNECTION_MODE=long_connection"
+            )
+        elif self.config.connection_mode != "long_connection":
+            errors.append(
+                "FEISHU_CONNECTION_MODE must be long_connection (webhook not implemented)"
+            )
         return errors
 
     async def start(self) -> None:
@@ -120,9 +129,7 @@ class FeishuAdapter:
         self._running = True
         self._loop = asyncio.get_running_loop()
         self._client = httpx.AsyncClient(timeout=self.http_timeout_sec)
-
-        if self.config.connection_mode == "long_connection":
-            self._start_long_connection()
+        self._start_long_connection()
 
         logger.info(f"Feishu adapter started (mode: {self.config.connection_mode})")
 

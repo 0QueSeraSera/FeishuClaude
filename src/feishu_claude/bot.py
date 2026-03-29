@@ -134,6 +134,7 @@ class FeishuClaudeBot:
         start_monotonic = time.monotonic()
         last_progress_monotonic = start_monotonic
         last_progress_event_count = 0
+        emitted_event_fingerprints: set[str] = set()
 
         async def progress_callback(
             event_count: int,
@@ -142,7 +143,17 @@ class FeishuClaudeBot:
         ) -> None:
             """Emit threshold-based progress updates to Feishu."""
             nonlocal last_progress_event_count, last_progress_monotonic
-            del event, summary
+            del summary
+
+            internal_update = self._internal_event_text(state, event)
+            if internal_update:
+                fingerprint = self._internal_event_fingerprint(event, internal_update)
+                if fingerprint not in emitted_event_fingerprints:
+                    emitted_event_fingerprints.add(fingerprint)
+                    await self.feishu.send_message(msg.chat_id, internal_update)
+                    last_progress_event_count = event_count
+                    last_progress_monotonic = time.monotonic()
+                    return
 
             if not self.settings.feishu_progress_updates_enabled:
                 return
@@ -649,6 +660,161 @@ class FeishuClaudeBot:
         if state.language == "en":
             return f"Still working... events={event_count}, elapsed={elapsed:.1f}s"
         return f"处理中... 事件: {event_count}，耗时: {elapsed:.1f}s"
+
+    def _internal_event_fingerprint(self, event: dict[str, Any], rendered: str) -> str:
+        """Build a stable fingerprint for streamed internal events.
+
+        Args:
+            event: One parsed Codex stream event.
+            rendered: Human-readable text rendered from the event.
+
+        Returns:
+            Deduplication fingerprint used inside one run.
+        """
+        event_type = self._event_type(event) or "unknown"
+        return f"{event_type}|{rendered}"
+
+    def _internal_event_text(self, state: ChatRuntimeState, event: dict[str, Any]) -> str | None:
+        """Format one internal Codex event for immediate Feishu delivery.
+
+        Args:
+            state: Chat runtime state, used for localized text.
+            event: Parsed Codex JSON event.
+
+        Returns:
+            Rendered event text for Feishu when this event should be surfaced;
+            otherwise ``None``.
+        """
+        event_type = self._event_type(event)
+        if not event_type:
+            return None
+
+        lower_type = event_type.lower()
+        if lower_type in {"thread.started", "turn.started", "turn.completed", "run.started", "run.completed"}:
+            return None
+        if lower_type.startswith("message") or "delta" in lower_type:
+            return None
+
+        tool_name = self._extract_event_tool_name(event)
+        command = self._extract_event_command(event)
+        message = self._extract_event_message(event)
+
+        is_internal = (
+            tool_name is not None
+            or command is not None
+            or any(token in lower_type for token in ("tool", "exec", "command", "patch", "script"))
+        )
+        if not is_internal:
+            return None
+
+        parts: list[str] = []
+        if tool_name:
+            parts.append(f"tool={tool_name}")
+        if command:
+            parts.append(f"cmd={self._truncate_for_feishu(command)}")
+        if message:
+            parts.append(f"note={self._truncate_for_feishu(message)}")
+
+        detail = ", ".join(parts) if parts else lower_type
+        if state.language == "en":
+            return f"[{event_type}] {detail}"
+        return f"[{event_type}] {detail}"
+
+    def _event_type(self, event: dict[str, Any]) -> str | None:
+        """Return normalized event type text when present."""
+        value = event.get("type")
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped:
+                return stripped
+        return None
+
+    def _extract_event_tool_name(self, event: dict[str, Any]) -> str | None:
+        """Extract a tool identifier from a stream event.
+
+        Args:
+            event: Parsed Codex JSON event.
+
+        Returns:
+            Tool identifier when the payload includes one.
+        """
+        candidates: list[Any] = [
+            event.get("tool_name"),
+            event.get("tool"),
+            event.get("name"),
+        ]
+
+        data = event.get("data")
+        if isinstance(data, dict):
+            candidates.extend([data.get("tool_name"), data.get("tool"), data.get("name")])
+
+        for value in candidates:
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+            if isinstance(value, dict):
+                nested_name = value.get("name")
+                if isinstance(nested_name, str) and nested_name.strip():
+                    return nested_name.strip()
+        return None
+
+    def _extract_event_command(self, event: dict[str, Any]) -> str | None:
+        """Extract command text from a stream event.
+
+        Args:
+            event: Parsed Codex JSON event.
+
+        Returns:
+            Shell/script command text when available.
+        """
+        candidates: list[Any] = [event.get("command"), event.get("cmd")]
+        data = event.get("data")
+        if isinstance(data, dict):
+            candidates.extend([data.get("command"), data.get("cmd")])
+            command_block = data.get("command")
+            if isinstance(command_block, dict):
+                candidates.extend([command_block.get("command"), command_block.get("cmd")])
+
+        for value in candidates:
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+        return None
+
+    def _extract_event_message(self, event: dict[str, Any]) -> str | None:
+        """Extract explanatory message text from a stream event.
+
+        Args:
+            event: Parsed Codex JSON event.
+
+        Returns:
+            Short message text when present.
+        """
+        candidates: list[Any] = [event.get("message"), event.get("text")]
+        error = event.get("error")
+        if isinstance(error, str):
+            candidates.append(error)
+        elif isinstance(error, dict):
+            candidates.append(error.get("message"))
+
+        data = event.get("data")
+        if isinstance(data, dict):
+            candidates.extend([data.get("message"), data.get("text")])
+
+        for value in candidates:
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+        return None
+
+    def _truncate_for_feishu(self, value: str, limit: int = 180) -> str:
+        """Truncate long event fragments for concise Feishu display."""
+        if len(value) <= limit:
+            return value
+        return value[: limit - 3] + "..."
 
     def _footer_text(self, state: ChatRuntimeState, response: ClaudeResponse) -> str:
         """Build compact execution footer."""

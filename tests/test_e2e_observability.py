@@ -104,3 +104,66 @@ async def test_e2e_codex_progress_updates_for_long_run():
     assert sent[0] == ("chat_progress", "已收到，处理中...")
     assert any("处理中... 事件:" in item[1] for item in sent[1:-1])
     assert "done" in sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_e2e_codex_streams_internal_tool_events_immediately():
+    """Internal tool/script events should be surfaced before final response."""
+    settings = Settings(
+        _env_file=None,
+        feishu_app_id="test_app_id",
+        feishu_app_secret="test_app_secret",
+        feishu_backend="codex",
+        feishu_progress_updates_enabled=False,
+    )
+    bot = FeishuClaudeBot(settings=settings)
+    sent: list[tuple[str, str]] = []
+
+    async def fake_send(chat_id: str, content: str) -> bool:
+        sent.append((chat_id, content))
+        return True
+
+    async def fake_codex(
+        chat_id: str,
+        message: str,
+        continue_session: bool = True,
+        *,
+        mode=None,
+        model=None,
+        search_enabled=None,
+        progress_callback=None,
+    ):
+        del chat_id, message, continue_session, mode, model, search_enabled
+        assert progress_callback is not None
+        summary = CodexEventSummary()
+        await progress_callback(
+            1,
+            {
+                "type": "tool.call.started",
+                "tool_name": "exec_command",
+                "command": "ls -la",
+            },
+            summary,
+        )
+        await progress_callback(
+            2,
+            {
+                "type": "tool.call.completed",
+                "tool_name": "exec_command",
+                "message": "exit_code=0",
+            },
+            summary,
+        )
+        return ClaudeResponse(content="final result", event_count=2, duration_ms=600)
+
+    bot.feishu.send_message = fake_send  # type: ignore[method-assign]
+    bot.codex.send_message = fake_codex  # type: ignore[method-assign]
+
+    await bot._handle_message(
+        FeishuMessage(chat_id="chat_internal", sender_id="user_t", content="run tools")
+    )
+
+    assert sent[0] == ("chat_internal", "已收到，处理中...")
+    assert any("tool.call.started" in item[1] for item in sent[1:-1])
+    assert any("cmd=ls -la" in item[1] for item in sent[1:-1])
+    assert "final result" in sent[-1][1]

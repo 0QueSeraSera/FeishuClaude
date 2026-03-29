@@ -50,7 +50,7 @@ class CodexEventSummary:
             self.session_id = session_id
 
         full_text = _extract_full_text(event)
-        if full_text:
+        if full_text and _is_assistant_text_event(event):
             self.final_text = full_text
 
         delta = _extract_delta_text(event)
@@ -165,28 +165,56 @@ class CodexSession:
             if process.stdout is None or process.stderr is None:
                 raise RuntimeError("Codex process stdout/stderr is unavailable")
 
-            stderr_task = asyncio.create_task(process.stderr.read())
+            stderr_lines: list[str] = []
+            line_queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
 
-            while True:
-                line_bytes = await process.stdout.readline()
-                if not line_bytes:
-                    break
+            async def pump_stream(stream: asyncio.StreamReader, source: str) -> None:
+                """Pump one subprocess stream into a shared queue.
 
-                line = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
-                raw_lines.append(line)
-                event = _parse_json_event(line)
-                if event is None:
-                    summary.ingest_non_json_line(line)
+                Args:
+                    stream: Source stream to consume line by line.
+                    source: Source label (`stdout` or `stderr`).
+                """
+                while True:
+                    line_bytes = await stream.readline()
+                    if not line_bytes:
+                        await line_queue.put((source, None))
+                        return
+                    line = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
+                    await line_queue.put((source, line))
+
+            stream_tasks = [
+                asyncio.create_task(pump_stream(process.stdout, "stdout")),
+                asyncio.create_task(pump_stream(process.stderr, "stderr")),
+            ]
+            open_stream_count = len(stream_tasks)
+
+            while open_stream_count > 0:
+                source, line = await line_queue.get()
+                if line is None:
+                    open_stream_count -= 1
                     continue
 
-                summary.update_from_event(event)
-                if progress_callback is not None:
-                    maybe_coro = progress_callback(summary.event_count, event, summary)
-                    if asyncio.iscoroutine(maybe_coro):
-                        await maybe_coro
+                raw_lines.append(line)
+                event = _parse_json_event(line)
+                if event is not None:
+                    summary.update_from_event(event)
+                    if progress_callback is not None:
+                        maybe_coro = progress_callback(summary.event_count, event, summary)
+                        if asyncio.iscoroutine(maybe_coro):
+                            await maybe_coro
+                    continue
+
+                if source == "stdout":
+                    summary.ingest_non_json_line(line)
+                else:
+                    stripped = line.strip()
+                    if stripped:
+                        stderr_lines.append(stripped)
 
             return_code = await process.wait()
-            stderr_output = (await stderr_task).decode("utf-8", errors="replace").strip()
+            await asyncio.gather(*stream_tasks)
+            stderr_output = "\n".join(stderr_lines).strip()
             elapsed_ms = int((time.monotonic() - start_monotonic) * 1000)
             if summary.duration_ms is None:
                 summary.duration_ms = elapsed_ms
@@ -209,7 +237,9 @@ class CodexSession:
             if summary.session_id:
                 self.session_id = summary.session_id
 
-            final_text = summary.resolved_final_text() or raw_output
+            final_text = summary.resolved_final_text()
+            if not final_text:
+                final_text = "Codex run completed without a final assistant message."
             return ClaudeResponse(
                 content=final_text,
                 session_id=self.session_id,
@@ -381,6 +411,33 @@ def _extract_session_id(event: dict[str, Any]) -> str | None:
     return None
 
 
+def _is_assistant_text_event(event: dict[str, Any]) -> bool:
+    """Return whether an event likely carries assistant-facing output text.
+
+    Args:
+        event: Parsed JSON event object.
+
+    Returns:
+        ``True`` when the event should contribute to final assistant text.
+    """
+    event_type = (_extract_event_type(event) or "").lower()
+    if event_type:
+        if any(token in event_type for token in ("error", "tool", "exec", "command", "patch")):
+            return False
+        if any(token in event_type for token in ("message", "response", "assistant", "output_text")):
+            return True
+
+    if "response" in event:
+        return True
+
+    message = event.get("message")
+    if isinstance(message, dict):
+        role = message.get("role")
+        if role == "assistant":
+            return True
+    return False
+
+
 def _extract_full_text(event: dict[str, Any]) -> str:
     """Extract full assistant text from event payload."""
     direct_keys = ("final_message", "text")
@@ -411,6 +468,21 @@ def _extract_full_text(event: dict[str, Any]) -> str:
     content = event.get("content")
     if isinstance(content, str) and content.strip():
         return content.strip()
+
+    response = event.get("response")
+    response_text = _extract_response_text(response)
+    if response_text:
+        return response_text
+
+    data = event.get("data")
+    response_text = _extract_response_text(data)
+    if response_text:
+        return response_text
+
+    output = event.get("output")
+    response_text = _extract_response_text(output)
+    if response_text:
+        return response_text
     return ""
 
 
@@ -423,6 +495,16 @@ def _extract_delta_text(event: dict[str, Any]) -> str:
     data = event.get("data")
     if isinstance(data, dict):
         nested_delta = data.get("delta")
+        if isinstance(nested_delta, str) and nested_delta:
+            return nested_delta
+        for key in ("text_delta", "output_text_delta"):
+            nested = data.get(key)
+            if isinstance(nested, str) and nested:
+                return nested
+
+    output = event.get("output")
+    if isinstance(output, dict):
+        nested_delta = output.get("delta")
         if isinstance(nested_delta, str) and nested_delta:
             return nested_delta
     return ""
@@ -476,3 +558,54 @@ def _extract_error_text(event: dict[str, Any]) -> str | None:
     if isinstance(message, str) and message.strip():
         return message.strip()
     return "unknown error"
+
+
+def _extract_response_text(value: Any) -> str:
+    """Extract assistant text from nested response payloads.
+
+    Args:
+        value: Potentially nested response payload from Codex JSON events.
+
+    Returns:
+        Combined assistant-authored text when available; otherwise an empty string.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else ""
+
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            text = _extract_response_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+
+    if not isinstance(value, dict):
+        return ""
+
+    if value.get("role") not in {None, "assistant"}:
+        return ""
+
+    item_type = value.get("type")
+    if item_type == "output_text":
+        text = value.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+    text = value.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    output_text = value.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    combined_parts: list[str] = []
+    for key in ("content", "output", "items", "response"):
+        nested = value.get(key)
+        nested_text = _extract_response_text(nested)
+        if nested_text:
+            combined_parts.append(nested_text)
+
+    return "\n".join(part for part in combined_parts if part).strip()

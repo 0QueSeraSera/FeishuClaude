@@ -85,6 +85,18 @@ def test_feishu_adapter_validation():
     assert len(errors) == 0
 
 
+def test_feishu_adapter_validation_rejects_webhook_mode():
+    """Webhook mode should fail validation until transport is implemented."""
+    config = FeishuConfig(
+        app_id="test",
+        app_secret="test",
+        connection_mode="webhook",
+    )
+    adapter = FeishuAdapter(config)
+    errors = adapter.validate_config()
+    assert any("webhook is not implemented yet" in error for error in errors)
+
+
 def test_feishu_message():
     """Test message dataclass."""
     msg = FeishuMessage(
