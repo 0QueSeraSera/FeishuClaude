@@ -13,7 +13,9 @@ from .claude_runner import ClaudeRunner, ClaudeResponse
 from .config import Settings, get_settings
 from .codex_runner import CodexEventSummary, CodexRunner, MODE_FLAG_MAP
 from .feishu_adapter import FeishuAdapter, FeishuConfig, FeishuMessage
+from .policy import ExecPolicyChecker
 from .runtime_state import BackendType, ChatRuntimeState
+from .safety import RiskIntentDetector
 
 logger = logging.getLogger("feishu_claude")
 
@@ -51,6 +53,8 @@ class FeishuClaudeBot:
         self.backend: BackendType = self.settings.feishu_backend
 
         self._chat_states: dict[str, ChatRuntimeState] = {}
+        self.risk_detector = RiskIntentDetector()
+        self.policy_checker = ExecPolicyChecker(self.settings.codex_execpolicy_rule_paths)
         self.feishu.set_message_handler(self._handle_message)
 
     async def start(self) -> None:
@@ -76,16 +80,29 @@ class FeishuClaudeBot:
     async def _handle_message(self, msg: FeishuMessage) -> None:
         """Process incoming Feishu message end-to-end."""
         logger.info(f"Message from {msg.sender_id} in {msg.chat_id}: {msg.content[:50]}...")
+        state = self._chat_state(msg.chat_id)
+
+        normalized = msg.content.strip().lower()
+        if normalized == "/confirm":
+            await self._handle_confirm_command(msg, state)
+            return
+        if normalized == "/cancel":
+            await self._handle_cancel_command(msg, state)
+            return
 
         command_response = await self._process_command(msg)
         if command_response is not None:
             await self.feishu.send_message(msg.chat_id, command_response)
             return
 
-        state = self._chat_state(msg.chat_id)
         try:
             if state.backend == "codex":
-                await self._handle_codex_message(msg, state)
+                await self._execute_codex_prompt_with_safety(
+                    msg=msg,
+                    state=state,
+                    prompt=msg.content,
+                    confirmation_granted=False,
+                )
                 return
 
             await self._handle_claude_message(msg, state)
@@ -94,12 +111,18 @@ class FeishuClaudeBot:
             logger.error(f"Error processing message: {exc}")
             await self.feishu.send_message(msg.chat_id, f"❌ Internal error: {exc}")
 
-    async def _handle_codex_message(self, msg: FeishuMessage, state: ChatRuntimeState) -> None:
+    async def _handle_codex_message(
+        self,
+        msg: FeishuMessage,
+        state: ChatRuntimeState,
+        prompt: str,
+    ) -> None:
         """Handle one message with Codex runner and staged Feishu responses.
 
         Args:
             msg: Incoming Feishu message.
             state: Chat-scoped runtime state.
+            prompt: Prompt text to execute after preflight checks.
         """
         await self.feishu.send_message(msg.chat_id, self._ack_text(state))
 
@@ -141,7 +164,7 @@ class FeishuClaudeBot:
 
         response = await self.codex.send_message(
             chat_id=msg.chat_id,
-            message=msg.content,
+            message=prompt,
             continue_session=True,
             mode=state.mode,
             model=state.effective_model(self.settings.codex_model),
@@ -149,7 +172,7 @@ class FeishuClaudeBot:
             progress_callback=progress_callback,
         )
 
-        prompt_hash = hashlib.sha256(msg.content.encode("utf-8")).hexdigest()[:12]
+        prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
         logger.info(
             "codex_run chat_id=%s mode=%s prompt_hash=%s events=%d duration_ms=%s cost_usd=%s "
             "is_error=%s",
@@ -196,6 +219,96 @@ class FeishuClaudeBot:
             return
 
         await self.feishu.send_message(msg.chat_id, response.content)
+
+    async def _execute_codex_prompt_with_safety(
+        self,
+        *,
+        msg: FeishuMessage,
+        state: ChatRuntimeState,
+        prompt: str,
+        confirmation_granted: bool,
+    ) -> None:
+        """Apply safety and policy gates before executing a Codex prompt.
+
+        Args:
+            msg: Original Feishu message envelope.
+            state: Chat runtime state.
+            prompt: Prompt text to execute.
+            confirmation_granted: Whether explicit user confirmation has been provided.
+        """
+        stripped_prompt = prompt.strip()
+        if not stripped_prompt:
+            await self.feishu.send_message(msg.chat_id, "Empty prompt ignored.")
+            return
+
+        if state.pending_confirmation_prompt and not confirmation_granted:
+            await self.feishu.send_message(msg.chat_id, self._pending_confirmation_text(state))
+            return
+
+        risk = self.risk_detector.assess(stripped_prompt)
+        if risk.is_risky and not confirmation_granted:
+            state.pending_confirmation_prompt = stripped_prompt
+            state.pending_confirmation_reason = risk.reason
+            logger.info(
+                "safety_gate chat_id=%s decision=prompt reason=%s",
+                msg.chat_id,
+                risk.reason,
+            )
+            await self.feishu.send_message(msg.chat_id, self._confirmation_prompt_text(state, risk.reason))
+            return
+
+        policy_decision = await self.policy_checker.check(stripped_prompt)
+        logger.info(
+            "policy_preflight chat_id=%s mode=%s decision=%s reason=%s",
+            msg.chat_id,
+            state.mode,
+            policy_decision.decision,
+            policy_decision.reason,
+        )
+        if policy_decision.decision in {"block", "unknown"}:
+            await self.feishu.send_message(
+                msg.chat_id,
+                self._policy_block_text(state, policy_decision.reason),
+            )
+            return
+        if policy_decision.decision == "prompt" and not confirmation_granted:
+            state.pending_confirmation_prompt = stripped_prompt
+            state.pending_confirmation_reason = f"policy: {policy_decision.reason}"
+            await self.feishu.send_message(
+                msg.chat_id,
+                self._confirmation_prompt_text(state, state.pending_confirmation_reason),
+            )
+            return
+
+        await self._handle_codex_message(msg, state, stripped_prompt)
+
+    async def _handle_confirm_command(self, msg: FeishuMessage, state: ChatRuntimeState) -> None:
+        """Execute pending risky prompt after explicit user confirmation."""
+        pending_prompt = state.pending_confirmation_prompt
+        if not pending_prompt:
+            await self.feishu.send_message(msg.chat_id, self._no_pending_confirmation_text(state))
+            return
+
+        state.pending_confirmation_prompt = None
+        state.pending_confirmation_reason = None
+        await self._execute_codex_prompt_with_safety(
+            msg=msg,
+            state=state,
+            prompt=pending_prompt,
+            confirmation_granted=True,
+        )
+
+    async def _handle_cancel_command(self, msg: FeishuMessage, state: ChatRuntimeState) -> None:
+        """Cancel pending risky prompt if present."""
+        if not state.pending_confirmation_prompt:
+            await self.feishu.send_message(msg.chat_id, self._no_pending_confirmation_text(state))
+            return
+        state.pending_confirmation_prompt = None
+        state.pending_confirmation_reason = None
+        if state.language == "en":
+            await self.feishu.send_message(msg.chat_id, "Pending risky action canceled.")
+        else:
+            await self.feishu.send_message(msg.chat_id, "已取消待确认的风险操作。")
 
     async def _process_command(self, msg: FeishuMessage) -> str | None:
         """Process bot commands and return response text when matched."""
@@ -247,6 +360,7 @@ class FeishuClaudeBot:
                 f"Backend: {state.backend}\n"
                 f"Mode: {state.mode}\n"
                 f"Search: {'on' if state.search_enabled else 'off'}\n"
+                f"Pending confirmation: {'yes' if state.pending_confirmation_prompt else 'no'}\n"
                 f"{runner_name} CLI: {status} {info}\n"
                 f"Workspace: {self._current_workspace(state.backend)}\n"
                 f"Model: {self._current_model_name(state)}\n"
@@ -270,6 +384,8 @@ class FeishuClaudeBot:
             "/model <name|default> - Set per-chat model override\n"
             "/search <on|off> - Toggle Codex web search\n"
             "/tools - Show effective safety controls\n"
+            "/confirm - Execute pending risky action\n"
+            "/cancel - Cancel pending risky action\n"
             "/status - Show bot status\n"
             "/ping - Check if bot is responsive\n"
             "\n"
@@ -370,8 +486,41 @@ class FeishuClaudeBot:
             f"Mode: {state.mode}\n"
             f"Flags: {flags}\n"
             f"Search: {'on' if state.search_enabled else 'off'}\n"
-            f"Model: {state.model or self.settings.codex_model or 'default'}"
+            f"Model: {state.model or self.settings.codex_model or 'default'}\n"
+            f"ExecPolicy rules: {self._policy_rules_text()}"
         )
+
+    def _policy_rules_text(self) -> str:
+        """Return compact text for configured execpolicy rules."""
+        if not self.policy_checker.enabled:
+            return "disabled"
+        return ",".join(str(rule) for rule in self.policy_checker.rules)
+
+    def _confirmation_prompt_text(self, state: ChatRuntimeState, reason: str) -> str:
+        """Build confirmation request message for risky operations."""
+        if state.language == "en":
+            return (
+                f"Risk gate triggered ({reason}). Reply /confirm to run, or /cancel to stop."
+            )
+        return f"检测到高风险操作（{reason}）。回复 /confirm 执行，或 /cancel 取消。"
+
+    def _pending_confirmation_text(self, state: ChatRuntimeState) -> str:
+        """Return message when a risk decision is pending user action."""
+        if state.language == "en":
+            return "A risky action is pending. Reply /confirm or /cancel first."
+        return "有待确认的风险操作。请先回复 /confirm 或 /cancel。"
+
+    def _no_pending_confirmation_text(self, state: ChatRuntimeState) -> str:
+        """Return message when no pending confirmation exists."""
+        if state.language == "en":
+            return "No pending risky action."
+        return "当前没有待确认的风险操作。"
+
+    def _policy_block_text(self, state: ChatRuntimeState, reason: str) -> str:
+        """Return policy-block response message."""
+        if state.language == "en":
+            return f"Blocked by policy: {reason}"
+        return f"已被策略阻止：{reason}"
 
     def _ack_text(self, state: ChatRuntimeState) -> str:
         """Return immediate acknowledgement text."""

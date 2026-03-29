@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     codex_default_mode: Literal["safe", "normal", "full"] = Field(
         default="safe", alias="CODEX_DEFAULT_MODE"
     )
+    codex_execpolicy_rules: str = Field(default="", alias="CODEX_EXECPOLICY_RULES")
 
     @field_validator("feishu_allow_user_ids", mode="before")
     @classmethod
@@ -83,6 +84,17 @@ class Settings(BaseSettings):
     def effective_codex_workspace(self) -> Path:
         """Return codex workspace, defaulting to Claude workspace/current directory."""
         return self.codex_workspace or self.claude_workspace
+
+    @property
+    def codex_execpolicy_rule_paths(self) -> list[Path]:
+        """Return parsed execpolicy rule file paths."""
+        if not self.codex_execpolicy_rules.strip():
+            return []
+        return [
+            Path(value.strip())
+            for value in self.codex_execpolicy_rules.split(",")
+            if value.strip()
+        ]
 
 
 @lru_cache
