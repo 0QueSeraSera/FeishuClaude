@@ -21,6 +21,8 @@ class ClaudeResponse:
     duration_ms: int | None = None
     is_error: bool = False
     raw_output: str = ""
+    event_count: int = 0
+    telemetry: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

@@ -35,7 +35,9 @@ async def test_e2e_message_uses_codex_backend():
         mode=None,
         model=None,
         search_enabled=None,
+        progress_callback=None,
     ):
+        del progress_callback
         calls["codex"] += 1
         return ClaudeResponse(content=f"codex:{message}")
 
@@ -51,7 +53,9 @@ async def test_e2e_message_uses_codex_backend():
         FeishuMessage(chat_id="chat_1", sender_id="user_1", content="ping codex")
     )
 
-    assert sent == [("chat_1", "codex:ping codex")]
+    assert sent[0] == ("chat_1", "已收到，处理中...")
+    assert "codex:ping codex" in sent[1][1]
+    assert "模式: safe" in sent[1][1]
     assert calls == {"codex": 1, "claude": 0}
 
 
@@ -117,7 +121,9 @@ async def test_e2e_mode_switch_applies_to_codex_runtime():
         mode=None,
         model=None,
         search_enabled=None,
+        progress_callback=None,
     ):
+        del progress_callback
         captured.update(
             {
                 "chat_id": chat_id,
@@ -149,4 +155,5 @@ async def test_e2e_mode_switch_applies_to_codex_runtime():
     assert captured["mode"] == "normal"
     assert captured["model"] == "gpt-5-codex"
     assert captured["search_enabled"] is True
-    assert sent[-1] == ("chat_3", "done")
+    assert sent[0] == ("chat_3", "已收到，处理中...")
+    assert "done" in sent[-1][1]

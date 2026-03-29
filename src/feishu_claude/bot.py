@@ -1,15 +1,17 @@
-"""Main bot logic that connects Feishu to Claude Code."""
+"""Main bot logic that connects Feishu to Claude/Codex backends."""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import time
 from pathlib import Path
-from typing import Literal
+from typing import Any
 
-from .claude_runner import ClaudeRunner
+from .claude_runner import ClaudeRunner, ClaudeResponse
 from .config import Settings, get_settings
-from .codex_runner import CodexRunner, ExecutionMode, MODE_FLAG_MAP
+from .codex_runner import CodexEventSummary, CodexRunner, MODE_FLAG_MAP
 from .feishu_adapter import FeishuAdapter, FeishuConfig, FeishuMessage
 from .runtime_state import BackendType, ChatRuntimeState
 
@@ -17,25 +19,22 @@ logger = logging.getLogger("feishu_claude")
 
 
 class FeishuClaudeBot:
-    """
-    Main bot class that bridges Feishu messages to Claude Code CLI.
-
-    Features:
-    - Receives messages from Feishu via WebSocket
-    - Routes messages to Claude Code CLI
-    - Sends responses back to Feishu
-    - Manages conversation sessions per chat
-    """
+    """Bridge Feishu messages to the selected AI backend runner."""
 
     def __init__(
         self,
         settings: Settings | None = None,
         workspace: Path | None = None,
     ):
+        """Initialize bot runtime components.
+
+        Args:
+            settings: Optional app settings object.
+            workspace: Optional workspace override for Claude backend.
+        """
         self.settings = settings or get_settings()
         self.workspace = workspace or self.settings.claude_workspace
 
-        # Initialize components
         feishu_config = FeishuConfig.from_settings(self.settings)
         self.feishu = FeishuAdapter(feishu_config)
         self.claude = ClaudeRunner(
@@ -51,15 +50,11 @@ class FeishuClaudeBot:
         )
         self.backend: BackendType = self.settings.feishu_backend
 
-        # Per-chat runtime state
         self._chat_states: dict[str, ChatRuntimeState] = {}
-
-        # Set up message handler
         self.feishu.set_message_handler(self._handle_message)
 
     async def start(self) -> None:
-        """Start the bot."""
-        # Validate configuration
+        """Start the bot and validate runtime prerequisites."""
         errors = self.settings.validate_feishu()
         if errors:
             raise ValueError("Configuration errors: " + "; ".join(errors))
@@ -70,66 +65,140 @@ class FeishuClaudeBot:
             raise RuntimeError(f"{runner_name} CLI not available: {info}")
         logger.info(f"{runner_name} CLI found at: {info}")
 
-        # Start Feishu adapter
         await self.feishu.start()
         logger.info("FeishuClaude bot started")
 
     async def stop(self) -> None:
-        """Stop the bot."""
+        """Stop bot resources."""
         await self.feishu.stop()
         logger.info("FeishuClaude bot stopped")
 
     async def _handle_message(self, msg: FeishuMessage) -> None:
-        """Process incoming Feishu message."""
+        """Process incoming Feishu message end-to-end."""
         logger.info(f"Message from {msg.sender_id} in {msg.chat_id}: {msg.content[:50]}...")
 
-        # Check for commands
-        response = await self._process_command(msg)
-        if response is not None:
-            await self.feishu.send_message(msg.chat_id, response)
+        command_response = await self._process_command(msg)
+        if command_response is not None:
+            await self.feishu.send_message(msg.chat_id, command_response)
             return
 
         state = self._chat_state(msg.chat_id)
-
         try:
-            _, runner = self._backend_runner(state.backend)
             if state.backend == "codex":
-                backend_response = await self.codex.send_message(
-                    chat_id=msg.chat_id,
-                    message=msg.content,
-                    continue_session=True,
-                    mode=state.mode,
-                    model=state.effective_model(self.settings.codex_model),
-                    search_enabled=state.search_enabled,
-                )
-            else:
-                session = self.claude.get_or_create_session(msg.chat_id)
-                session.model = state.effective_model(self.settings.claude_model)
-                backend_response = await self.claude.send_message(
-                    chat_id=msg.chat_id,
-                    message=msg.content,
-                    continue_session=True,
-                )
+                await self._handle_codex_message(msg, state)
+                return
 
-            if backend_response.is_error:
-                logger.error(f"Runner error: {backend_response.content}")
-                await self.feishu.send_message(
-                    msg.chat_id,
-                    f"❌ {backend_response.content}",
-                )
-            else:
-                # Send backend response
-                await self.feishu.send_message(msg.chat_id, backend_response.content)
+            await self._handle_claude_message(msg, state)
 
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
+        except Exception as exc:
+            logger.error(f"Error processing message: {exc}")
+            await self.feishu.send_message(msg.chat_id, f"❌ Internal error: {exc}")
+
+    async def _handle_codex_message(self, msg: FeishuMessage, state: ChatRuntimeState) -> None:
+        """Handle one message with Codex runner and staged Feishu responses.
+
+        Args:
+            msg: Incoming Feishu message.
+            state: Chat-scoped runtime state.
+        """
+        await self.feishu.send_message(msg.chat_id, self._ack_text(state))
+
+        start_monotonic = time.monotonic()
+        last_progress_monotonic = start_monotonic
+        last_progress_event_count = 0
+
+        async def progress_callback(
+            event_count: int,
+            event: dict[str, Any],
+            summary: CodexEventSummary,
+        ) -> None:
+            """Emit threshold-based progress updates to Feishu."""
+            nonlocal last_progress_event_count, last_progress_monotonic
+            del event, summary
+
+            if not self.settings.feishu_progress_updates_enabled:
+                return
+
+            elapsed = time.monotonic() - start_monotonic
+            if elapsed < self.settings.feishu_progress_min_seconds:
+                return
+
+            if event_count - last_progress_event_count < self.settings.feishu_progress_event_interval:
+                return
+
+            if (
+                time.monotonic() - last_progress_monotonic
+                < self.settings.feishu_progress_min_interval_seconds
+            ):
+                return
+
+            last_progress_event_count = event_count
+            last_progress_monotonic = time.monotonic()
             await self.feishu.send_message(
                 msg.chat_id,
-                f"❌ Internal error: {e}",
+                self._progress_text(state, event_count, elapsed),
             )
 
+        response = await self.codex.send_message(
+            chat_id=msg.chat_id,
+            message=msg.content,
+            continue_session=True,
+            mode=state.mode,
+            model=state.effective_model(self.settings.codex_model),
+            search_enabled=state.search_enabled,
+            progress_callback=progress_callback,
+        )
+
+        prompt_hash = hashlib.sha256(msg.content.encode("utf-8")).hexdigest()[:12]
+        logger.info(
+            "codex_run chat_id=%s mode=%s prompt_hash=%s events=%d duration_ms=%s cost_usd=%s "
+            "is_error=%s",
+            msg.chat_id,
+            state.mode,
+            prompt_hash,
+            response.event_count,
+            response.duration_ms,
+            response.cost_usd,
+            response.is_error,
+        )
+
+        footer = self._footer_text(state, response)
+        if response.is_error:
+            await self.feishu.send_message(
+                msg.chat_id,
+                self._format_error(state, response.content, footer),
+            )
+            return
+
+        await self.feishu.send_message(
+            msg.chat_id,
+            self._format_final(state, response.content, footer),
+        )
+
+    async def _handle_claude_message(self, msg: FeishuMessage, state: ChatRuntimeState) -> None:
+        """Handle one message with Claude backend.
+
+        Args:
+            msg: Incoming Feishu message.
+            state: Chat-scoped runtime state.
+        """
+        session = self.claude.get_or_create_session(msg.chat_id)
+        session.model = state.effective_model(self.settings.claude_model)
+        response = await self.claude.send_message(
+            chat_id=msg.chat_id,
+            message=msg.content,
+            continue_session=True,
+        )
+
+        if response.is_error:
+            logger.error(f"Runner error: {response.content}")
+            await self.feishu.send_message(msg.chat_id, f"❌ {response.content}")
+            return
+
+        await self.feishu.send_message(msg.chat_id, response.content)
+
     async def _process_command(self, msg: FeishuMessage) -> str | None:
-        """Process bot commands. Returns response or None if not a command."""
+        """Process bot commands and return response text when matched."""
         content = msg.content.strip()
         tokens = content.split()
         if not tokens:
@@ -187,11 +256,10 @@ class FeishuClaudeBot:
         if cmd == "/ping":
             return "pong 🏓"
 
-        # Not a command
         return None
 
     def _help_text(self) -> str:
-        """Generate help text."""
+        """Return command help text."""
         return (
             "🤖 FeishuClaude Bot Commands\n"
             "\n"
@@ -212,7 +280,6 @@ class FeishuClaudeBot:
         """Run the bot until interrupted."""
         await self.start()
         try:
-            # Keep running until cancelled
             while True:
                 await asyncio.sleep(3600)
         except asyncio.CancelledError:
@@ -220,15 +287,8 @@ class FeishuClaudeBot:
         finally:
             await self.stop()
 
-    def _backend_runner(
-        self,
-        backend: BackendType,
-    ) -> tuple[str, ClaudeRunner | CodexRunner]:
-        """Get backend runner by backend id.
-
-        Returns:
-            Tuple of display name and runner instance.
-        """
+    def _backend_runner(self, backend: BackendType) -> tuple[str, ClaudeRunner | CodexRunner]:
+        """Get backend runner by backend id."""
         if backend == "codex":
             return "Codex", self.codex
         return "Claude", self.claude
@@ -240,6 +300,7 @@ class FeishuClaudeBot:
                 backend=self.backend,
                 mode=self.settings.codex_default_mode,
                 search_enabled=self.settings.codex_search_enabled,
+                language=self.settings.feishu_default_language,
             )
         return self._chat_states[chat_id]
 
@@ -262,8 +323,8 @@ class FeishuClaudeBot:
         value = tokens[1].strip().lower()
         if value not in {"safe", "normal", "full"}:
             return "Invalid mode. Use /mode <safe|normal|full>."
-        mode = value  # type: ignore[assignment]
-        state.mode = mode
+        mode: str = value
+        state.mode = mode  # type: ignore[assignment]
         warning = ""
         if mode == "full":
             warning = "\n⚠️ full mode bypasses approvals and sandbox."
@@ -311,3 +372,42 @@ class FeishuClaudeBot:
             f"Search: {'on' if state.search_enabled else 'off'}\n"
             f"Model: {state.model or self.settings.codex_model or 'default'}"
         )
+
+    def _ack_text(self, state: ChatRuntimeState) -> str:
+        """Return immediate acknowledgement text."""
+        if state.language == "en":
+            return "Received. Processing..."
+        return "已收到，处理中..."
+
+    def _progress_text(self, state: ChatRuntimeState, event_count: int, elapsed: float) -> str:
+        """Build progress message for long-running tasks."""
+        if state.language == "en":
+            return f"Still working... events={event_count}, elapsed={elapsed:.1f}s"
+        return f"处理中... 事件: {event_count}，耗时: {elapsed:.1f}s"
+
+    def _footer_text(self, state: ChatRuntimeState, response: ClaudeResponse) -> str:
+        """Build compact execution footer."""
+        seconds = (response.duration_ms or 0) / 1000.0
+        cost = response.cost_usd if response.cost_usd is not None else 0.0
+        if state.language == "en":
+            return (
+                f"Mode: {state.mode} | Duration: {seconds:.1f}s | "
+                f"Events: {response.event_count} | EstCost: ${cost:.4f}"
+            )
+        return (
+            f"模式: {state.mode} | 耗时: {seconds:.1f}s | "
+            f"事件: {response.event_count} | 估算成本: ${cost:.4f}"
+        )
+
+    def _format_final(self, state: ChatRuntimeState, content: str, footer: str) -> str:
+        """Format successful final response message."""
+        final_content = content.strip()
+        if not final_content:
+            final_content = "已完成，但未返回文本结果。" if state.language == "zh" else "Done with no text output."
+        return f"{final_content}\n\n{footer}"
+
+    def _format_error(self, state: ChatRuntimeState, content: str, footer: str) -> str:
+        """Format failed final response message."""
+        if state.language == "en":
+            return f"❌ Failed: {content}\n\n{footer}"
+        return f"❌ 执行失败: {content}\n\n{footer}"

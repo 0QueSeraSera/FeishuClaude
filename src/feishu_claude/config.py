@@ -30,6 +30,17 @@ class Settings(BaseSettings):
     feishu_allow_user_ids: str = Field(default="", alias="FEISHU_ALLOW_USER_IDS")
     feishu_allow_group_chats: bool = Field(default=True, alias="FEISHU_ALLOW_GROUP_CHATS")
     feishu_backend: Literal["claude", "codex"] = Field(default="claude", alias="FEISHU_BACKEND")
+    feishu_default_language: Literal["zh", "en"] = Field(default="zh", alias="FEISHU_DEFAULT_LANGUAGE")
+    feishu_progress_updates_enabled: bool = Field(
+        default=True,
+        alias="FEISHU_PROGRESS_UPDATES_ENABLED",
+    )
+    feishu_progress_event_interval: int = Field(default=30, alias="FEISHU_PROGRESS_EVENT_INTERVAL")
+    feishu_progress_min_seconds: float = Field(default=8.0, alias="FEISHU_PROGRESS_MIN_SECONDS")
+    feishu_progress_min_interval_seconds: float = Field(
+        default=2.0,
+        alias="FEISHU_PROGRESS_MIN_INTERVAL_SECONDS",
+    )
 
     # Claude Configuration
     claude_workspace: Path = Field(default=Path("."), alias="CLAUDE_WORKSPACE")

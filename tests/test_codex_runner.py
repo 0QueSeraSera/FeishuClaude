@@ -16,12 +16,37 @@ class _FakeProcess:
 
     def __init__(self, *, returncode: int, stdout: bytes, stderr: bytes):
         self.returncode = returncode
-        self._stdout = stdout
-        self._stderr = stderr
+        self.stdout = _FakeStream(stdout)
+        self.stderr = _FakeStream(stderr)
 
-    async def communicate(self) -> tuple[bytes, bytes]:
-        """Return preconfigured pipes."""
-        return self._stdout, self._stderr
+    async def wait(self) -> int:
+        """Return preconfigured process exit code."""
+        return self.returncode
+
+
+class _FakeStream:
+    """Minimal stream object with readline/read APIs."""
+
+    def __init__(self, payload: bytes):
+        self._lines = payload.splitlines(keepends=True)
+        self._line_index = 0
+        self._payload = payload
+        self._read_used = False
+
+    async def readline(self) -> bytes:
+        """Read one line from stream payload."""
+        if self._line_index >= len(self._lines):
+            return b""
+        line = self._lines[self._line_index]
+        self._line_index += 1
+        return line
+
+    async def read(self) -> bytes:
+        """Read remaining stream payload."""
+        if self._read_used:
+            return b""
+        self._read_used = True
+        return self._payload
 
 
 def test_codex_session_build_args():
@@ -113,6 +138,57 @@ async def test_codex_send_message_success(monkeypatch: pytest.MonkeyPatch):
     assert response.is_error is False
     assert response.content == "Hello from Codex"
     assert response.session_id == "ses_1"
+    assert response.event_count == 2
+
+
+@pytest.mark.asyncio
+async def test_codex_send_message_partial_events(monkeypatch: pytest.MonkeyPatch):
+    """Runner should merge delta events and capture telemetry fields."""
+    expected_workspace = Path("/tmp/codex")
+    stdout = (
+        '{"type":"run.started","session_id":"ses_partial"}\n'
+        '{"type":"message.delta","delta":"Hello "}\n'
+        '{"type":"message.delta","delta":"world"}\n'
+        '{"type":"run.completed","usage":{"total_cost_usd":0.015},"duration_ms":2300}\n'
+    ).encode("utf-8")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        assert kwargs["cwd"] == str(expected_workspace)
+        return _FakeProcess(returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    runner = CodexRunner(workspace=expected_workspace)
+    response = await runner.send_message("chat_1", "hello")
+
+    assert response.is_error is False
+    assert response.content == "Hello world"
+    assert response.cost_usd == 0.015
+    assert response.duration_ms == 2300
+    assert response.event_count == 4
+
+
+@pytest.mark.asyncio
+async def test_codex_send_message_progress_callback(monkeypatch: pytest.MonkeyPatch):
+    """Runner should call progress callback for each parsed JSON event."""
+    stdout = (
+        '{"type":"run.started","session_id":"ses_9"}\n'
+        '{"type":"message","text":"Final"}\n'
+    ).encode("utf-8")
+    events: list[int] = []
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return _FakeProcess(returncode=0, stdout=stdout, stderr=b"")
+
+    async def progress_callback(event_count, event, summary):
+        del event, summary
+        events.append(event_count)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    runner = CodexRunner()
+    response = await runner.send_message("chat_a", "hello", progress_callback=progress_callback)
+
+    assert response.is_error is False
+    assert events == [1, 2]
 
 
 @pytest.mark.asyncio
