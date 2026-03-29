@@ -115,14 +115,15 @@ class CodexSession:
         Returns:
             List of command arguments for subprocess execution.
         """
-        args = ["codex", "exec"]
+        global_flags, exec_flags = _split_mode_flags(MODE_FLAG_MAP[self.mode])
+        args = ["codex", *global_flags, "exec"]
         if continue_session and self.session_id:
             args.extend(["resume", self.session_id, prompt])
         else:
             args.append(prompt)
 
         args.extend(["--cd", str(self.workspace), "--json"])
-        args.extend(MODE_FLAG_MAP[self.mode])
+        args.extend(exec_flags)
 
         if self.model:
             args.extend(["--model", self.model])
@@ -336,6 +337,26 @@ def _parse_json_event(line: str) -> dict[str, Any] | None:
     if isinstance(parsed, dict):
         return parsed
     return None
+
+
+def _split_mode_flags(mode_flags: tuple[str, ...]) -> tuple[list[str], list[str]]:
+    """Split mode flags into root-level and `exec`-level argument groups.
+
+    Args:
+        mode_flags: Mode mapping tuple from `MODE_FLAG_MAP`.
+
+    Returns:
+        A tuple of `(global_flags, exec_flags)`.
+    """
+    remaining = list(mode_flags)
+    global_flags: list[str] = []
+    ask_flag = "--ask-for-approval"
+    if ask_flag in remaining:
+        idx = remaining.index(ask_flag)
+        if idx + 1 < len(remaining):
+            global_flags.extend([ask_flag, remaining[idx + 1]])
+            del remaining[idx:idx + 2]
+    return global_flags, remaining
 
 
 def _extract_event_type(event: dict[str, Any]) -> str | None:

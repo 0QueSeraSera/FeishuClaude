@@ -54,7 +54,7 @@ def test_codex_session_build_args():
     session = CodexSession(workspace=Path("/tmp/workspace"))
 
     args = session.build_args("read project", continue_session=False)
-    assert args[:2] == ["codex", "exec"]
+    assert args[:4] == ["codex", "--ask-for-approval", "never", "exec"]
     assert "--json" in args
     assert "--cd" in args
     assert "read-only" in args
@@ -88,6 +88,8 @@ def test_codex_args_snapshot_for_normal_mode():
     args = session.build_args("fix bug", continue_session=False)
     assert args == [
         "codex",
+        "--ask-for-approval",
+        "on-request",
         "exec",
         "fix bug",
         "--cd",
@@ -95,8 +97,6 @@ def test_codex_args_snapshot_for_normal_mode():
         "--json",
         "--sandbox",
         "workspace-write",
-        "--ask-for-approval",
-        "on-request",
         "--model",
         "gpt-5-codex",
         "--search",
