@@ -14,6 +14,7 @@ def clear_relevant_env(monkeypatch):
         "FEISHU_CONNECTION_MODE",
         "FEISHU_ALLOW_GROUP_CHATS",
         "FEISHU_ALLOW_USER_IDS",
+        "CODEX_MODEL",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -24,6 +25,7 @@ def test_settings_defaults():
     assert settings.feishu_connection_mode == "long_connection"
     assert settings.feishu_allow_group_chats is True
     assert settings.feishu_backend == "codex"
+    assert settings.codex_model == "gpt-5.3-codex"
 
 
 def test_settings_validation():

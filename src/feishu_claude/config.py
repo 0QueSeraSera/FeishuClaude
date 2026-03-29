@@ -51,7 +51,7 @@ class Settings(BaseSettings):
 
     # Codex Configuration
     codex_workspace: Path | None = Field(default=None, alias="CODEX_WORKSPACE")
-    codex_model: str | None = Field(default=None, alias="CODEX_MODEL")
+    codex_model: str | None = Field(default="gpt-5.3-codex", alias="CODEX_MODEL")
     codex_search_enabled: bool = Field(default=False, alias="CODEX_SEARCH_ENABLED")
     codex_default_mode: Literal["safe", "normal", "full"] = Field(
         default="safe", alias="CODEX_DEFAULT_MODE"

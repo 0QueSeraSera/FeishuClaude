@@ -23,10 +23,37 @@ Connect Feishu bot to local Codex CLI (default) with Claude rollback support.
    # Edit .env with your Feishu app credentials
    ```
 
-3. **Run the bot**:
+3. **Run startup checks**:
+   ```bash
+   feishu-claude --once
+   ```
+
+4. **Run the bot**:
    ```bash
    feishu-claude
    ```
+
+## Enable Codex in `.env`
+
+```env
+FEISHU_APP_ID=your_feishu_app_id
+FEISHU_APP_SECRET=your_feishu_app_secret
+FEISHU_CONNECTION_MODE=long_connection
+FEISHU_BACKEND=codex
+
+# Optional Codex controls
+CODEX_WORKSPACE=.
+CODEX_MODEL=gpt-5.3-codex
+CODEX_DEFAULT_MODE=safe
+CODEX_SEARCH_ENABLED=false
+# CODEX_EXECPOLICY_RULES=/path/to/rules-1.json,/path/to/rules-2.json
+```
+
+If you need temporary rollback, set:
+
+```env
+FEISHU_BACKEND=claude
+```
 
 ## Configuration
 
@@ -47,9 +74,14 @@ Connect Feishu bot to local Codex CLI (default) with Claude rollback support.
 | `FEISHU_BACKEND` | `claude` or `codex` | No (default: codex) |
 | `FEISHU_ALLOW_USER_IDS` | Comma-separated allowed user IDs | No (allow all) |
 | `FEISHU_ALLOW_GROUP_CHATS` | Allow group chats | No (default: true) |
+| `FEISHU_DEFAULT_LANGUAGE` | Response language (`zh` or `en`) | No (default: `zh`) |
+| `FEISHU_DEFAULT_TURN_LIMIT` | Default per-chat turn limit | No |
+| `FEISHU_DEFAULT_BUDGET_USD` | Default per-chat budget limit (USD) | No |
 | `CLAUDE_WORKSPACE` | Working directory for Claude | No (default: current dir) |
 | `CODEX_WORKSPACE` | Working directory for Codex | No (default: CLAUDE_WORKSPACE) |
 | `CODEX_MODEL` | Codex model override | No |
+| `CODEX_DEFAULT_MODE` | Codex mode (`safe`, `normal`, `full`) | No (default: `safe`) |
+| `CODEX_SEARCH_ENABLED` | Enable Codex web search by default | No (default: `false`) |
 | `CODEX_EXECPOLICY_RULES` | Comma-separated execpolicy rule files | No |
 
 ## Commands
