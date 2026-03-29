@@ -45,7 +45,7 @@ def test_bot_backend_selection_codex(test_settings):
     """Test backend selector can route to Codex."""
     codex_settings = test_settings.model_copy(update={"feishu_backend": "codex"})
     bot = FeishuClaudeBot(settings=codex_settings)
-    backend_name, runner = bot._selected_backend_runner()
+    backend_name, runner = bot._backend_runner("codex")
     assert backend_name == "Codex"
     assert runner is bot.codex
 
@@ -114,6 +114,74 @@ async def test_status_command_includes_backend(test_settings):
     )
     assert response is not None
     assert "Backend: codex" in response
+    assert "Mode: safe" in response
+
+
+@pytest.mark.asyncio
+async def test_mode_command_updates_chat_state(test_settings):
+    """Mode command should persist per chat."""
+    bot = FeishuClaudeBot(settings=test_settings)
+
+    response = await bot._process_command(
+        FeishuMessage(chat_id="chat_123", sender_id="user_456", content="/mode normal")
+    )
+    assert response == "Mode set to `normal`."
+    assert bot._chat_state("chat_123").mode == "normal"
+
+    invalid = await bot._process_command(
+        FeishuMessage(chat_id="chat_123", sender_id="user_456", content="/mode invalid")
+    )
+    assert "Invalid mode" in (invalid or "")
+
+
+@pytest.mark.asyncio
+async def test_model_and_search_commands(test_settings):
+    """Model and search commands should update per-chat runtime options."""
+    bot = FeishuClaudeBot(settings=test_settings)
+
+    model_response = await bot._process_command(
+        FeishuMessage(chat_id="chat_1", sender_id="user_1", content="/model gpt-5-codex")
+    )
+    assert "gpt-5-codex" in (model_response or "")
+    assert bot._chat_state("chat_1").model == "gpt-5-codex"
+
+    search_response = await bot._process_command(
+        FeishuMessage(chat_id="chat_1", sender_id="user_1", content="/search on")
+    )
+    assert search_response == "Search enabled for this chat."
+    assert bot._chat_state("chat_1").search_enabled is True
+
+    clear_response = await bot._process_command(
+        FeishuMessage(chat_id="chat_1", sender_id="user_1", content="/model default")
+    )
+    assert "cleared" in (clear_response or "").lower()
+    assert bot._chat_state("chat_1").model is None
+
+
+@pytest.mark.asyncio
+async def test_tools_command_reflects_effective_flags(test_settings):
+    """Tools command should reflect mode/search/model in codex backend."""
+    codex_settings = test_settings.model_copy(update={"feishu_backend": "codex"})
+    bot = FeishuClaudeBot(settings=codex_settings)
+
+    await bot._process_command(
+        FeishuMessage(chat_id="chat_x", sender_id="user_x", content="/mode normal")
+    )
+    await bot._process_command(
+        FeishuMessage(chat_id="chat_x", sender_id="user_x", content="/search on")
+    )
+    await bot._process_command(
+        FeishuMessage(chat_id="chat_x", sender_id="user_x", content="/model gpt-5-codex")
+    )
+
+    tools_response = await bot._process_command(
+        FeishuMessage(chat_id="chat_x", sender_id="user_x", content="/tools")
+    )
+    assert tools_response is not None
+    assert "Mode: normal" in tools_response
+    assert "--sandbox workspace-write" in tools_response
+    assert "Search: on" in tools_response
+    assert "gpt-5-codex" in tools_response
 
 
 @pytest.mark.asyncio

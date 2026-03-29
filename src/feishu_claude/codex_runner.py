@@ -12,6 +12,11 @@ from typing import Any, Literal
 from .claude_runner import ClaudeResponse
 
 ExecutionMode = Literal["safe", "normal", "full"]
+MODE_FLAG_MAP: dict[ExecutionMode, tuple[str, ...]] = {
+    "safe": ("--sandbox", "read-only", "--ask-for-approval", "never"),
+    "normal": ("--sandbox", "workspace-write", "--ask-for-approval", "on-request"),
+    "full": ("--dangerously-bypass-approvals-and-sandbox",),
+}
 
 
 @dataclass
@@ -42,12 +47,7 @@ class CodexSession:
 
         args.extend(["--cd", str(self.workspace), "--json"])
 
-        if self.mode == "safe":
-            args.extend(["--sandbox", "read-only", "--ask-for-approval", "never"])
-        elif self.mode == "normal":
-            args.extend(["--sandbox", "workspace-write", "--ask-for-approval", "on-request"])
-        elif self.mode == "full":
-            args.append("--dangerously-bypass-approvals-and-sandbox")
+        args.extend(MODE_FLAG_MAP[self.mode])
 
         if self.model:
             args.extend(["--model", self.model])
@@ -169,9 +169,31 @@ class CodexRunner:
         chat_id: str,
         message: str,
         continue_session: bool = True,
+        *,
+        mode: ExecutionMode | None = None,
+        model: str | None = None,
+        search_enabled: bool | None = None,
     ) -> ClaudeResponse:
-        """Send a message to Codex for a specific chat."""
+        """Send a message to Codex for a specific chat.
+
+        Args:
+            chat_id: Feishu chat identifier.
+            message: User prompt text.
+            continue_session: Whether to continue previous session for this chat.
+            mode: Optional runtime mode override.
+            model: Optional runtime model override.
+            search_enabled: Optional runtime search toggle override.
+
+        Returns:
+            Runner response for the bot orchestration layer.
+        """
         session = self.get_or_create_session(chat_id)
+        if mode is not None:
+            session.mode = mode
+        if model is not None:
+            session.model = model
+        if search_enabled is not None:
+            session.search_enabled = search_enabled
         return await session.send(message, continue_session)
 
 

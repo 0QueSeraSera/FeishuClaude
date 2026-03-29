@@ -52,6 +52,32 @@ def test_codex_session_build_args():
     assert "--search" in args
 
 
+def test_codex_args_snapshot_for_normal_mode():
+    """Snapshot-like test for canonical command mapping."""
+    session = CodexSession(
+        workspace=Path("/repo"),
+        mode="normal",
+        model="gpt-5-codex",
+        search_enabled=True,
+    )
+    args = session.build_args("fix bug", continue_session=False)
+    assert args == [
+        "codex",
+        "exec",
+        "fix bug",
+        "--cd",
+        "/repo",
+        "--json",
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "--model",
+        "gpt-5-codex",
+        "--search",
+    ]
+
+
 def test_codex_check_cli_available(monkeypatch: pytest.MonkeyPatch):
     """CLI availability checks should map to shutil.which results."""
     monkeypatch.setattr(shutil, "which", lambda _: "/usr/local/bin/codex")
