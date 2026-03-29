@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     )
     feishu_allow_user_ids: str = Field(default="", alias="FEISHU_ALLOW_USER_IDS")
     feishu_allow_group_chats: bool = Field(default=True, alias="FEISHU_ALLOW_GROUP_CHATS")
-    feishu_backend: Literal["claude", "codex"] = Field(default="claude", alias="FEISHU_BACKEND")
+    feishu_backend: Literal["claude", "codex"] = Field(default="codex", alias="FEISHU_BACKEND")
     feishu_default_language: Literal["zh", "en"] = Field(default="zh", alias="FEISHU_DEFAULT_LANGUAGE")
     feishu_progress_updates_enabled: bool = Field(
         default=True,

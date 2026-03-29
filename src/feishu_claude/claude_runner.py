@@ -49,9 +49,6 @@ class ClaudeSession:
         if self.max_turns:
             args.extend(["--max-turns", str(self.max_turns)])
 
-        # Skip permission prompts for bot usage
-        args.append("--dangerously-skip-permissions")
-
         # Add the prompt
         args.append(prompt)
 

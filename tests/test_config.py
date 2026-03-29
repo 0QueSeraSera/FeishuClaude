@@ -23,6 +23,7 @@ def test_settings_defaults():
     settings = Settings(_env_file=None)
     assert settings.feishu_connection_mode == "long_connection"
     assert settings.feishu_allow_group_chats is True
+    assert settings.feishu_backend == "codex"
 
 
 def test_settings_validation():

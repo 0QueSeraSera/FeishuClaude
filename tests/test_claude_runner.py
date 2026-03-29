@@ -33,7 +33,6 @@ def test_session_build_args():
     assert "claude" in args[0]
     assert "--print" in args
     assert "Hello" in args
-    assert "--dangerously-skip-permissions" in args
 
     # Continue with explicit session id
     session.session_id = "ses_123"

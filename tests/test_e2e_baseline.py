@@ -18,6 +18,7 @@ def test_settings() -> Settings:
         feishu_app_id="test_app_id",
         feishu_app_secret="test_app_secret",
         feishu_connection_mode="long_connection",
+        feishu_backend="claude",
     )
 
 

@@ -38,7 +38,7 @@ def test_bot_init(test_settings):
     assert bot.feishu is not None
     assert bot.claude is not None
     assert bot.codex is not None
-    assert bot.backend == "claude"
+    assert bot.backend == "codex"
 
 
 def test_bot_backend_selection_codex(test_settings):
@@ -114,6 +114,7 @@ async def test_status_command_includes_backend(test_settings):
     )
     assert response is not None
     assert "Backend: codex" in response
+    assert "Backend note: default" in response
     assert "Mode: safe" in response
 
 

@@ -376,6 +376,7 @@ class FeishuClaudeBot:
             return (
                 f"🤖 FeishuClaude Status\n"
                 f"Backend: {state.backend}\n"
+                f"Backend note: {self._backend_note(state.backend)}\n"
                 f"Mode: {state.mode}\n"
                 f"Search: {'on' if state.search_enabled else 'off'}\n"
                 f"Pending confirmation: {'yes' if state.pending_confirmation_prompt else 'no'}\n"
@@ -455,6 +456,12 @@ class FeishuClaudeBot:
         if backend == "codex":
             return self.settings.effective_codex_workspace
         return self.workspace
+
+    def _backend_note(self, backend: BackendType) -> str:
+        """Return backend rollout note for status output."""
+        if backend == "codex":
+            return "default"
+        return "rollback-only (deprecated)"
 
     def _handle_mode_command(self, tokens: list[str], state: ChatRuntimeState) -> str:
         """Handle `/mode` command parsing and state update."""
@@ -540,6 +547,7 @@ class FeishuClaudeBot:
             return (
                 "Tools snapshot\n"
                 "Backend: claude\n"
+                "Claude backend is rollback-only and deprecated.\n"
                 "Codex safety controls are available after switching backend to codex."
             )
 
