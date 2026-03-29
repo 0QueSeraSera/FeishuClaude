@@ -5,9 +5,22 @@ import pytest
 from feishu_claude.config import Settings
 
 
+@pytest.fixture(autouse=True)
+def clear_relevant_env(monkeypatch):
+    """Clear env vars that can leak local settings into tests."""
+    for key in (
+        "FEISHU_APP_ID",
+        "FEISHU_APP_SECRET",
+        "FEISHU_CONNECTION_MODE",
+        "FEISHU_ALLOW_GROUP_CHATS",
+        "FEISHU_ALLOW_USER_IDS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 def test_settings_defaults():
     """Test default settings values."""
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.feishu_connection_mode == "long_connection"
     assert settings.feishu_allow_group_chats is True
 
@@ -15,6 +28,7 @@ def test_settings_defaults():
 def test_settings_validation():
     """Test configuration validation."""
     settings = Settings(
+        _env_file=None,
         feishu_app_id="",  # Empty should fail
         feishu_app_secret="",  # Empty should fail
     )
@@ -28,10 +42,11 @@ def test_allowed_user_ids_parsing():
     """Test parsing of allowed user IDs."""
     # Need to pass via environment or use the correct field name
     import os
+
     os.environ["FEISHU_ALLOW_USER_IDS"] = "ou_123, ou_456 , ou_789"
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.allowed_user_ids == {"ou_123", "ou_456", "ou_789"}
     del os.environ["FEISHU_ALLOW_USER_IDS"]
 
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.allowed_user_ids == set()
