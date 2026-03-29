@@ -12,6 +12,37 @@ from feishu_claude.feishu_adapter import (
 )
 
 
+class _FakeResponse:
+    """Minimal HTTP response test double."""
+
+    def __init__(self, *, code: int = 0, msg: str = "ok"):
+        self._data = {"code": code, "msg": msg}
+
+    def raise_for_status(self) -> None:
+        """No-op status checker for successful fake responses."""
+
+    def json(self) -> dict[str, object]:
+        """Return fake JSON payload."""
+        return self._data
+
+
+class _FakeAsyncClient:
+    """Minimal async HTTP client test double."""
+
+    def __init__(self, responses: dict[str, _FakeResponse]):
+        self.responses = responses
+        self.urls: list[str] = []
+
+    async def post(self, url: str, json: dict, headers: dict[str, str]) -> _FakeResponse:
+        """Record request URL and return predefined response."""
+        del json, headers
+        self.urls.append(url)
+        for pattern, response in self.responses.items():
+            if pattern in url:
+                return response
+        raise AssertionError(f"Unexpected URL in test: {url}")
+
+
 def test_str_or_none():
     """Test string conversion helper."""
     assert _str_or_none("hello") == "hello"
@@ -112,3 +143,51 @@ def test_feishu_message():
     assert msg.content == "Hello world"
     assert msg.message_type == "text"
     assert msg.chat_type == "p2p"
+
+
+@pytest.mark.asyncio
+async def test_send_message_falls_back_to_reply(monkeypatch):
+    """Adapter should retry via reply API when chat send fails."""
+    config = FeishuConfig(app_id="app", app_secret="secret")
+    adapter = FeishuAdapter(config)
+
+    fake_client = _FakeAsyncClient(
+        responses={
+            "receive_id_type=chat_id": _FakeResponse(code=99991663, msg="forbidden"),
+            "/reply": _FakeResponse(code=0, msg="ok"),
+        }
+    )
+    adapter._client = fake_client
+    adapter._remember_latest_message_id("chat_1", "om_1")
+
+    async def fake_token() -> str:
+        return "tenant_token"
+
+    monkeypatch.setattr(adapter, "_get_tenant_access_token", fake_token)
+
+    result = await adapter.send_message("chat_1", "hello")
+
+    assert result is True
+    assert any("receive_id_type=chat_id" in url for url in fake_client.urls)
+    assert any("/im/v1/messages/om_1/reply" in url for url in fake_client.urls)
+
+
+@pytest.mark.asyncio
+async def test_send_message_fails_without_reply_fallback(monkeypatch):
+    """Adapter should return False when primary send fails and no reply target exists."""
+    config = FeishuConfig(app_id="app", app_secret="secret")
+    adapter = FeishuAdapter(config)
+    adapter._client = _FakeAsyncClient(
+        responses={
+            "receive_id_type=chat_id": _FakeResponse(code=99991663, msg="forbidden"),
+        }
+    )
+
+    async def fake_token() -> str:
+        return "tenant_token"
+
+    monkeypatch.setattr(adapter, "_get_tenant_access_token", fake_token)
+
+    result = await adapter.send_message("chat_missing", "hello")
+
+    assert result is False

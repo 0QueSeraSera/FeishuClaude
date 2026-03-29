@@ -8,8 +8,9 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -47,7 +48,7 @@ class FeishuConfig:
     dedup_cache_size: int = 1024
 
     @classmethod
-    def from_settings(cls, settings: Any) -> "FeishuConfig":
+    def from_settings(cls, settings: Any) -> FeishuConfig:
         """Create config from Settings object."""
         return cls(
             app_id=settings.feishu_app_id,
@@ -94,6 +95,7 @@ class FeishuAdapter:
 
         # Message deduplication
         self._seen_ids: OrderedDict[str, None] = OrderedDict()
+        self._latest_message_id_by_chat: OrderedDict[str, str] = OrderedDict()
 
         # Message handler callback
         self._on_message: Callable[[FeishuMessage], None] | None = None
@@ -152,43 +154,142 @@ class FeishuAdapter:
         logger.info("Feishu adapter stopped")
 
     async def send_message(self, chat_id: str, content: str) -> bool:
-        """Send a text message to a Feishu chat."""
+        """Send a text message to a Feishu chat.
+
+        Args:
+            chat_id: Target Feishu chat ID.
+            content: Text content to send.
+
+        Returns:
+            True when any delivery path succeeds, otherwise False.
+        """
         if self._client is None:
             logger.error("Client not initialized")
             return False
 
         try:
             token = await self._get_tenant_access_token()
-            payload = {
-                "receive_id": chat_id,
-                "msg_type": "text",
-                "content": json.dumps({"text": content}, ensure_ascii=False),
-            }
-            url = f"{self.api_base}/im/v1/messages?receive_id_type=chat_id"
 
-            response = await self._client.post(
-                url,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
+            if await self._send_chat_message(chat_id, content, token):
+                return True
 
-            if data.get("code") != 0:
-                logger.error(f"Feishu send failed: code={data.get('code')} msg={data.get('msg')}")
+            message_id = self._latest_message_id_by_chat.get(chat_id)
+            if not message_id:
+                logger.error(
+                    "Feishu send failed and no message_id fallback found for chat_id=%s",
+                    chat_id,
+                )
                 return False
 
-            return True
+            logger.warning(
+                (
+                    "Feishu chat send failed for chat_id=%s, "
+                    "retrying with reply fallback message_id=%s"
+                ),
+                chat_id,
+                message_id,
+            )
+            return await self._send_reply_message(message_id, content, token)
 
         except Exception as e:
             logger.error(f"Failed to send message: {e}")
             return False
 
+    async def _send_chat_message(self, chat_id: str, content: str, token: str) -> bool:
+        """Send a message using `chat_id` as receive target.
+
+        Args:
+            chat_id: Target Feishu chat ID.
+            content: Text content to send.
+            token: Tenant access token.
+
+        Returns:
+            True if Feishu returns a success code.
+        """
+        payload = {
+            "receive_id": chat_id,
+            "msg_type": "text",
+            "content": json.dumps({"text": content}, ensure_ascii=False),
+        }
+        url = f"{self.api_base}/im/v1/messages?receive_id_type=chat_id"
+        return await self._post_message_request(
+            url=url,
+            payload=payload,
+            token=token,
+            target=f"chat:{chat_id}",
+        )
+
+    async def _send_reply_message(self, message_id: str, content: str, token: str) -> bool:
+        """Reply to an inbound message by `message_id`.
+
+        Args:
+            message_id: Source message ID for reply routing.
+            content: Text content to send.
+            token: Tenant access token.
+
+        Returns:
+            True if Feishu returns a success code.
+        """
+        payload = {
+            "msg_type": "text",
+            "content": json.dumps({"text": content}, ensure_ascii=False),
+        }
+        url = f"{self.api_base}/im/v1/messages/{message_id}/reply"
+        return await self._post_message_request(
+            url=url,
+            payload=payload,
+            token=token,
+            target=f"reply:{message_id}",
+        )
+
+    async def _post_message_request(
+        self,
+        *,
+        url: str,
+        payload: dict[str, Any],
+        token: str,
+        target: str,
+    ) -> bool:
+        """Send one Feishu message HTTP request.
+
+        Args:
+            url: Request URL.
+            payload: JSON payload body.
+            token: Tenant access token.
+            target: Log label for target route.
+
+        Returns:
+            True when Feishu code equals zero.
+        """
+        if self._client is None:
+            raise RuntimeError("HTTP client not initialized")
+
+        response = await self._client.post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("code") != 0:
+            logger.error(
+                "Feishu send failed target=%s code=%s msg=%s",
+                target,
+                data.get("code"),
+                data.get("msg"),
+            )
+            return False
+
+        return True
+
     def _start_long_connection(self) -> None:
         """Start WebSocket long-connection."""
+        import_started = time.monotonic()
+        logger.info("Initializing Feishu long-connection SDK...")
         try:
             import lark_oapi as lark
         except ImportError as e:
@@ -196,6 +297,10 @@ class FeishuAdapter:
                 "lark-oapi is required for long_connection mode. "
                 "Install with: pip install lark-oapi"
             ) from e
+        logger.info(
+            "Feishu long-connection SDK initialized in %.1fs",
+            time.monotonic() - import_started,
+        )
 
         builder = lark.EventDispatcherHandler.builder("", self.config.verification_token or "")
         register = getattr(builder, "register_p2_im_message_receive_v1", None)
@@ -212,7 +317,11 @@ class FeishuAdapter:
         )
 
         self._ws_stop.clear()
-        self._ws_thread = threading.Thread(target=self._run_ws_forever, daemon=True, name="feishu-ws")
+        self._ws_thread = threading.Thread(
+            target=self._run_ws_forever,
+            daemon=True,
+            name="feishu-ws",
+        )
         self._ws_thread.start()
         logger.info("WebSocket long-connection started")
 
@@ -293,6 +402,8 @@ class FeishuAdapter:
         chat_id = _str_or_none(_obj_get(message, "chat_id"))
         if not chat_id:
             return
+        if message_id:
+            self._remember_latest_message_id(chat_id, message_id)
 
         message_type = (_str_or_none(_obj_get(message, "message_type")) or "text").lower()
         content = _extract_message_text(message_type, _obj_get(message, "content"))
@@ -372,6 +483,21 @@ class FeishuAdapter:
         while len(self._seen_ids) > self.config.dedup_cache_size:
             self._seen_ids.popitem(last=False)
         return False
+
+    def _remember_latest_message_id(self, chat_id: str, message_id: str) -> None:
+        """Track most recent inbound message ID for per-chat reply fallback.
+
+        Args:
+            chat_id: Feishu chat ID.
+            message_id: Inbound message ID.
+        """
+        if not chat_id or not message_id:
+            return
+        if chat_id in self._latest_message_id_by_chat:
+            del self._latest_message_id_by_chat[chat_id]
+        self._latest_message_id_by_chat[chat_id] = message_id
+        while len(self._latest_message_id_by_chat) > self.config.dedup_cache_size:
+            self._latest_message_id_by_chat.popitem(last=False)
 
     def _log_future_error(self, future: Any) -> None:
         """Log errors from async futures."""
