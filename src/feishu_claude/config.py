@@ -41,6 +41,8 @@ class Settings(BaseSettings):
         default=2.0,
         alias="FEISHU_PROGRESS_MIN_INTERVAL_SECONDS",
     )
+    feishu_default_turn_limit: int | None = Field(default=None, alias="FEISHU_DEFAULT_TURN_LIMIT")
+    feishu_default_budget_usd: float | None = Field(default=None, alias="FEISHU_DEFAULT_BUDGET_USD")
 
     # Claude Configuration
     claude_workspace: Path = Field(default=Path("."), alias="CLAUDE_WORKSPACE")

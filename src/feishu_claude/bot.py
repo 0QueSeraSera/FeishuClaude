@@ -105,6 +105,11 @@ class FeishuClaudeBot:
                 )
                 return
 
+            guardrail_block = self._guardrail_block_text(state)
+            if guardrail_block:
+                await self.feishu.send_message(msg.chat_id, guardrail_block)
+                return
+
             await self._handle_claude_message(msg, state)
 
         except Exception as exc:
@@ -171,6 +176,7 @@ class FeishuClaudeBot:
             search_enabled=state.search_enabled,
             progress_callback=progress_callback,
         )
+        self._record_usage(state, response)
 
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
         logger.info(
@@ -212,6 +218,7 @@ class FeishuClaudeBot:
             message=msg.content,
             continue_session=True,
         )
+        self._record_usage(state, response)
 
         if response.is_error:
             logger.error(f"Runner error: {response.content}")
@@ -239,6 +246,11 @@ class FeishuClaudeBot:
         stripped_prompt = prompt.strip()
         if not stripped_prompt:
             await self.feishu.send_message(msg.chat_id, "Empty prompt ignored.")
+            return
+
+        guardrail_block = self._guardrail_block_text(state)
+        if guardrail_block:
+            await self.feishu.send_message(msg.chat_id, guardrail_block)
             return
 
         if state.pending_confirmation_prompt and not confirmation_granted:
@@ -348,6 +360,12 @@ class FeishuClaudeBot:
         if cmd == "/search":
             return self._handle_search_command(tokens, state)
 
+        if cmd == "/turns":
+            return self._handle_turns_command(tokens, state)
+
+        if cmd == "/budget":
+            return self._handle_budget_command(tokens, state)
+
         if cmd == "/tools":
             return self._tools_text(state)
 
@@ -361,6 +379,8 @@ class FeishuClaudeBot:
                 f"Mode: {state.mode}\n"
                 f"Search: {'on' if state.search_enabled else 'off'}\n"
                 f"Pending confirmation: {'yes' if state.pending_confirmation_prompt else 'no'}\n"
+                f"Turns: {self._turns_status_text(state)}\n"
+                f"Budget: {self._budget_status_text(state)}\n"
                 f"{runner_name} CLI: {status} {info}\n"
                 f"Workspace: {self._current_workspace(state.backend)}\n"
                 f"Model: {self._current_model_name(state)}\n"
@@ -383,6 +403,8 @@ class FeishuClaudeBot:
             "/mode <safe|normal|full> - Set Codex execution mode\n"
             "/model <name|default> - Set per-chat model override\n"
             "/search <on|off> - Toggle Codex web search\n"
+            "/turns <n|off> - Set per-chat turn limit\n"
+            "/budget <usd|off> - Set per-chat budget limit\n"
             "/tools - Show effective safety controls\n"
             "/confirm - Execute pending risky action\n"
             "/cancel - Cancel pending risky action\n"
@@ -417,6 +439,8 @@ class FeishuClaudeBot:
                 mode=self.settings.codex_default_mode,
                 search_enabled=self.settings.codex_search_enabled,
                 language=self.settings.feishu_default_language,
+                turn_limit=self.settings.feishu_default_turn_limit,
+                budget_limit_usd=self.settings.feishu_default_budget_usd,
             )
         return self._chat_states[chat_id]
 
@@ -470,6 +494,46 @@ class FeishuClaudeBot:
             return "Search disabled for this chat."
         return "Invalid value. Use /search <on|off>."
 
+    def _handle_turns_command(self, tokens: list[str], state: ChatRuntimeState) -> str:
+        """Handle `/turns` command parsing and state update."""
+        if len(tokens) != 2:
+            return "Usage: /turns <n|off>"
+        value = tokens[1].strip().lower()
+        if value in {"off", "none", "unlimited"}:
+            state.turn_limit = None
+            return "Turn limit disabled for this chat."
+
+        try:
+            limit = int(value)
+        except ValueError:
+            return "Invalid turns value. Use a positive integer or /turns off."
+
+        if limit <= 0:
+            return "Turn limit must be greater than 0."
+
+        state.turn_limit = limit
+        return f"Turn limit set to {limit}."
+
+    def _handle_budget_command(self, tokens: list[str], state: ChatRuntimeState) -> str:
+        """Handle `/budget` command parsing and state update."""
+        if len(tokens) != 2:
+            return "Usage: /budget <usd|off>"
+        value = tokens[1].strip().lower()
+        if value in {"off", "none", "unlimited"}:
+            state.budget_limit_usd = None
+            return "Budget limit disabled for this chat."
+
+        try:
+            limit = float(value)
+        except ValueError:
+            return "Invalid budget value. Use a positive number or /budget off."
+
+        if limit <= 0:
+            return "Budget limit must be greater than 0."
+
+        state.budget_limit_usd = limit
+        return f"Budget limit set to ${limit:.4f}."
+
     def _tools_text(self, state: ChatRuntimeState) -> str:
         """Return chat-scoped safety control snapshot."""
         if state.backend != "codex":
@@ -487,7 +551,9 @@ class FeishuClaudeBot:
             f"Flags: {flags}\n"
             f"Search: {'on' if state.search_enabled else 'off'}\n"
             f"Model: {state.model or self.settings.codex_model or 'default'}\n"
-            f"ExecPolicy rules: {self._policy_rules_text()}"
+            f"ExecPolicy rules: {self._policy_rules_text()}\n"
+            f"Turns: {self._turns_status_text(state)}\n"
+            f"Budget: {self._budget_status_text(state)}"
         )
 
     def _policy_rules_text(self) -> str:
@@ -521,6 +587,48 @@ class FeishuClaudeBot:
         if state.language == "en":
             return f"Blocked by policy: {reason}"
         return f"已被策略阻止：{reason}"
+
+    def _guardrail_block_text(self, state: ChatRuntimeState) -> str | None:
+        """Return guardrail limit-hit message when execution should be blocked."""
+        if state.turn_limit is not None and state.turns_used >= state.turn_limit:
+            if state.language == "en":
+                return f"Turn limit reached ({state.turns_used}/{state.turn_limit})."
+            return f"已达到轮次上限（{state.turns_used}/{state.turn_limit}）。"
+
+        if state.budget_limit_usd is not None and state.budget_used_usd >= state.budget_limit_usd:
+            if state.language == "en":
+                return (
+                    "Budget limit reached "
+                    f"(${state.budget_used_usd:.4f}/${state.budget_limit_usd:.4f})."
+                )
+            return (
+                "已达到预算上限 "
+                f"(${state.budget_used_usd:.4f}/${state.budget_limit_usd:.4f})。"
+            )
+        return None
+
+    def _record_usage(self, state: ChatRuntimeState, response: ClaudeResponse) -> None:
+        """Record turn and budget usage after one backend attempt."""
+        state.turns_used += 1
+        if response.cost_usd is not None and response.cost_usd > 0:
+            state.budget_used_usd += response.cost_usd
+
+    def _turns_status_text(self, state: ChatRuntimeState) -> str:
+        """Return turns usage text for status output."""
+        if state.turn_limit is None:
+            return f"{state.turns_used}/unlimited"
+        remaining = max(state.turn_limit - state.turns_used, 0)
+        return f"{state.turns_used}/{state.turn_limit} (remaining {remaining})"
+
+    def _budget_status_text(self, state: ChatRuntimeState) -> str:
+        """Return budget usage text for status output."""
+        if state.budget_limit_usd is None:
+            return f"${state.budget_used_usd:.4f}/unlimited"
+        remaining = max(state.budget_limit_usd - state.budget_used_usd, 0.0)
+        return (
+            f"${state.budget_used_usd:.4f}/${state.budget_limit_usd:.4f} "
+            f"(remaining ${remaining:.4f})"
+        )
 
     def _ack_text(self, state: ChatRuntimeState) -> str:
         """Return immediate acknowledgement text."""

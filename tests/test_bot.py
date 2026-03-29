@@ -185,6 +185,34 @@ async def test_tools_command_reflects_effective_flags(test_settings):
 
 
 @pytest.mark.asyncio
+async def test_budget_and_turn_commands(test_settings):
+    """Budget and turn commands should update guardrail state."""
+    bot = FeishuClaudeBot(settings=test_settings)
+
+    turns_response = await bot._process_command(
+        FeishuMessage(chat_id="chat_limit", sender_id="user_1", content="/turns 3")
+    )
+    assert turns_response == "Turn limit set to 3."
+    assert bot._chat_state("chat_limit").turn_limit == 3
+
+    budget_response = await bot._process_command(
+        FeishuMessage(chat_id="chat_limit", sender_id="user_1", content="/budget 1.5")
+    )
+    assert budget_response == "Budget limit set to $1.5000."
+    assert bot._chat_state("chat_limit").budget_limit_usd == 1.5
+
+    disable_turns = await bot._process_command(
+        FeishuMessage(chat_id="chat_limit", sender_id="user_1", content="/turns off")
+    )
+    assert "disabled" in (disable_turns or "").lower()
+
+    disable_budget = await bot._process_command(
+        FeishuMessage(chat_id="chat_limit", sender_id="user_1", content="/budget off")
+    )
+    assert "disabled" in (disable_budget or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_start_fails_when_selected_backend_cli_missing(test_settings, monkeypatch):
     """Startup checks should fail if selected backend CLI is unavailable."""
     codex_settings = test_settings.model_copy(update={"feishu_backend": "codex"})
