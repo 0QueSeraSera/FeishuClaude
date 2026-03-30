@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,12 +106,19 @@ class CodexSession:
     search_enabled: bool = False
     mode: ExecutionMode = "safe"
 
-    def build_args(self, prompt: str, continue_session: bool = False) -> list[str]:
+    def build_args(
+        self,
+        prompt: str,
+        continue_session: bool = False,
+        *,
+        output_last_message_path: Path | None = None,
+    ) -> list[str]:
         """Build CLI arguments for Codex.
 
         Args:
             prompt: User prompt to pass into `codex exec`.
             continue_session: Whether to resume an existing session when possible.
+            output_last_message_path: Optional path for `--output-last-message`.
 
         Returns:
             List of command arguments for subprocess execution.
@@ -123,6 +131,8 @@ class CodexSession:
             args.append(prompt)
 
         args.extend(["--cd", str(self.workspace), "--json"])
+        if output_last_message_path is not None:
+            args.extend(["--output-last-message", str(output_last_message_path)])
         args.extend(exec_flags)
 
         if self.model:
@@ -149,7 +159,12 @@ class CodexSession:
         Returns:
             Bot-compatible response object with telemetry and final text.
         """
-        args = self.build_args(prompt, continue_session)
+        output_last_message_path = _new_last_message_path()
+        args = self.build_args(
+            prompt,
+            continue_session,
+            output_last_message_path=output_last_message_path,
+        )
         start_monotonic = time.monotonic()
         summary = CodexEventSummary()
         raw_lines: list[str] = []
@@ -239,6 +254,8 @@ class CodexSession:
 
             final_text = summary.resolved_final_text()
             if not final_text:
+                final_text = _read_last_message_file(output_last_message_path)
+            if not final_text:
                 final_text = "Codex run completed without a final assistant message."
             return ClaudeResponse(
                 content=final_text,
@@ -260,6 +277,8 @@ class CodexSession:
                 content=f"Error running Codex: {exc}",
                 is_error=True,
             )
+        finally:
+            _cleanup_last_message_file(output_last_message_path)
 
 
 class CodexRunner:
@@ -430,10 +449,25 @@ def _is_assistant_text_event(event: dict[str, Any]) -> bool:
     if "response" in event:
         return True
 
+    item = event.get("item")
+    if _extract_response_text(item):
+        return True
+
+    output_item = event.get("output_item")
+    if _extract_response_text(output_item):
+        return True
+
     message = event.get("message")
     if isinstance(message, dict):
         role = message.get("role")
         if role == "assistant":
+            return True
+
+    data = event.get("data")
+    if isinstance(data, dict):
+        if _extract_response_text(data.get("item")):
+            return True
+        if _extract_response_text(data.get("output_item")):
             return True
     return False
 
@@ -469,20 +503,11 @@ def _extract_full_text(event: dict[str, Any]) -> str:
     if isinstance(content, str) and content.strip():
         return content.strip()
 
-    response = event.get("response")
-    response_text = _extract_response_text(response)
-    if response_text:
-        return response_text
-
-    data = event.get("data")
-    response_text = _extract_response_text(data)
-    if response_text:
-        return response_text
-
-    output = event.get("output")
-    response_text = _extract_response_text(output)
-    if response_text:
-        return response_text
+    nested_keys = ("response", "data", "output", "item", "output_item")
+    for key in nested_keys:
+        response_text = _extract_response_text(event.get(key))
+        if response_text:
+            return response_text
     return ""
 
 
@@ -507,6 +532,18 @@ def _extract_delta_text(event: dict[str, Any]) -> str:
         nested_delta = output.get("delta")
         if isinstance(nested_delta, str) and nested_delta:
             return nested_delta
+
+    for key in ("item", "output_item"):
+        delta_text = _extract_delta_from_payload(event.get(key))
+        if delta_text:
+            return delta_text
+
+    data = event.get("data")
+    if isinstance(data, dict):
+        for key in ("item", "output_item"):
+            delta_text = _extract_delta_from_payload(data.get(key))
+            if delta_text:
+                return delta_text
     return ""
 
 
@@ -609,3 +646,82 @@ def _extract_response_text(value: Any) -> str:
             combined_parts.append(nested_text)
 
     return "\n".join(part for part in combined_parts if part).strip()
+
+
+def _extract_delta_from_payload(value: Any) -> str:
+    """Extract best-effort output text delta from nested payload fragments.
+
+    Args:
+        value: Potentially nested payload associated with streaming delta events.
+
+    Returns:
+        One text delta chunk when available; otherwise an empty string.
+    """
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, list):
+        for item in value:
+            delta_text = _extract_delta_from_payload(item)
+            if delta_text:
+                return delta_text
+        return ""
+
+    if not isinstance(value, dict):
+        return ""
+
+    for key in ("delta", "text_delta", "output_text_delta"):
+        nested = value.get(key)
+        if isinstance(nested, str) and nested:
+            return nested
+
+    for key in ("item", "content", "output", "response", "data"):
+        nested = value.get(key)
+        delta_text = _extract_delta_from_payload(nested)
+        if delta_text:
+            return delta_text
+    return ""
+
+
+def _new_last_message_path() -> Path | None:
+    """Create a temporary path for Codex `--output-last-message`.
+
+    Returns:
+        Temporary file path when creation succeeds, otherwise ``None``.
+    """
+    try:
+        with tempfile.NamedTemporaryFile(prefix="codex-last-message-", suffix=".txt", delete=False) as handle:
+            return Path(handle.name)
+    except OSError:
+        return None
+
+
+def _read_last_message_file(path: Path | None) -> str:
+    """Read text persisted by Codex `--output-last-message`.
+
+    Args:
+        path: Temporary file path used for the last message export.
+
+    Returns:
+        Stripped message text when present, otherwise an empty string.
+    """
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _cleanup_last_message_file(path: Path | None) -> None:
+    """Remove temporary output-last-message file if it exists.
+
+    Args:
+        path: Temporary file path to remove.
+    """
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return

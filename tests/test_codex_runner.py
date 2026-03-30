@@ -226,6 +226,53 @@ async def test_codex_send_message_parses_nested_response_payload(monkeypatch: py
 
 
 @pytest.mark.asyncio
+async def test_codex_send_message_parses_item_completed_assistant_payload(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Runner should extract assistant text from item-completed event payloads."""
+    stdout = (
+        '{"type":"turn.started"}\n'
+        '{"type":"item.completed","item":{"type":"message","role":"assistant",'
+        '"content":[{"type":"output_text","text":"Item hello"}]}}\n'
+    ).encode("utf-8")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return _FakeProcess(returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    runner = CodexRunner()
+    response = await runner.send_message("chat_item", "hello")
+
+    assert response.is_error is False
+    assert response.content == "Item hello"
+
+
+@pytest.mark.asyncio
+async def test_codex_send_message_reads_output_last_message_file(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Runner should fallback to output-last-message file when JSON has no final text."""
+    stdout = (
+        '{"type":"thread.started","thread_id":"th_1"}\n'
+        '{"type":"turn.completed"}\n'
+    ).encode("utf-8")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        args_list = list(args)
+        output_flag_index = args_list.index("--output-last-message")
+        output_path = Path(args_list[output_flag_index + 1])
+        output_path.write_text("Final from file", encoding="utf-8")
+        return _FakeProcess(returncode=0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    runner = CodexRunner()
+    response = await runner.send_message("chat_file", "hello")
+
+    assert response.is_error is False
+    assert response.content == "Final from file"
+
+
+@pytest.mark.asyncio
 async def test_codex_send_message_uses_friendly_fallback_when_no_final_text(
     monkeypatch: pytest.MonkeyPatch,
 ):

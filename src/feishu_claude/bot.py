@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from pathlib import Path
@@ -690,24 +691,34 @@ class FeishuClaudeBot:
             return None
 
         lower_type = event_type.lower()
-        if lower_type in {"thread.started", "turn.started", "turn.completed", "run.started", "run.completed"}:
+        item = self._extract_event_item(event)
+        item_type = self._extract_event_item_type(item)
+        lower_item_type = item_type.lower() if item_type else ""
+
+        lifecycle_events = {"thread.started", "turn.started", "turn.completed", "run.started", "run.completed"}
+        if lower_type in lifecycle_events:
             return None
-        if lower_type.startswith("message") or "delta" in lower_type:
+        if self._is_assistant_output_event(lower_type, item):
             return None
 
         tool_name = self._extract_event_tool_name(event)
         command = self._extract_event_command(event)
         message = self._extract_event_message(event)
 
+        lower_text_tokens = ("tool", "exec", "command", "patch", "script", "error", "failed", "approval")
+        item_tokens = ("tool", "function_call", "command", "exec", "patch", "script", "call")
         is_internal = (
             tool_name is not None
             or command is not None
-            or any(token in lower_type for token in ("tool", "exec", "command", "patch", "script"))
+            or any(token in lower_type for token in lower_text_tokens)
+            or any(token in lower_item_type for token in item_tokens)
         )
         if not is_internal:
             return None
 
         parts: list[str] = []
+        if item_type:
+            parts.append(f"item={item_type}")
         if tool_name:
             parts.append(f"tool={tool_name}")
         if command:
@@ -729,6 +740,57 @@ class FeishuClaudeBot:
                 return stripped
         return None
 
+    def _extract_event_item(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        """Extract nested item payload from one stream event.
+
+        Args:
+            event: Parsed Codex JSON event.
+
+        Returns:
+            First nested item-like payload when present.
+        """
+        candidates: list[Any] = [event.get("item"), event.get("output_item")]
+        data = event.get("data")
+        if isinstance(data, dict):
+            candidates.extend([data.get("item"), data.get("output_item")])
+
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                return candidate
+        return None
+
+    def _extract_event_item_type(self, item: dict[str, Any] | None) -> str | None:
+        """Extract item type label from nested item payload."""
+        if not isinstance(item, dict):
+            return None
+        value = item.get("type")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    def _is_assistant_output_event(self, lower_event_type: str, item: dict[str, Any] | None) -> bool:
+        """Return whether an event should be treated as assistant-output stream noise.
+
+        Args:
+            lower_event_type: Lower-cased event type string.
+            item: Optional nested item payload.
+
+        Returns:
+            ``True`` when the event is assistant output text that should not be
+            mirrored as an internal progress update.
+        """
+        if lower_event_type.startswith("message") or "delta" in lower_event_type:
+            return True
+        if lower_event_type.startswith("response.output_text"):
+            return True
+        if not isinstance(item, dict):
+            return False
+        item_type = item.get("type")
+        role = item.get("role")
+        if isinstance(item_type, str) and item_type.lower() == "message" and role in {None, "assistant"}:
+            return True
+        return False
+
     def _extract_event_tool_name(self, event: dict[str, Any]) -> str | None:
         """Extract a tool identifier from a stream event.
 
@@ -747,6 +809,10 @@ class FeishuClaudeBot:
         data = event.get("data")
         if isinstance(data, dict):
             candidates.extend([data.get("tool_name"), data.get("tool"), data.get("name")])
+
+        item = self._extract_event_item(event)
+        if isinstance(item, dict):
+            candidates.extend([item.get("tool_name"), item.get("tool"), item.get("name"), item.get("call")])
 
         for value in candidates:
             if isinstance(value, str):
@@ -776,11 +842,32 @@ class FeishuClaudeBot:
             if isinstance(command_block, dict):
                 candidates.extend([command_block.get("command"), command_block.get("cmd")])
 
+        item = self._extract_event_item(event)
+        if isinstance(item, dict):
+            candidates.extend(
+                [
+                    item.get("command"),
+                    item.get("cmd"),
+                    item.get("arguments"),
+                    item.get("input"),
+                ]
+            )
+
         for value in candidates:
             if isinstance(value, str):
                 stripped = value.strip()
                 if stripped:
+                    parsed_command = self._extract_command_from_arguments_text(stripped)
+                    if parsed_command:
+                        return parsed_command
                     return stripped
+            if isinstance(value, dict):
+                command_value = value.get("command")
+                if isinstance(command_value, str) and command_value.strip():
+                    return command_value.strip()
+                cmd_value = value.get("cmd")
+                if isinstance(cmd_value, str) and cmd_value.strip():
+                    return cmd_value.strip()
         return None
 
     def _extract_event_message(self, event: dict[str, Any]) -> str | None:
@@ -803,12 +890,66 @@ class FeishuClaudeBot:
         if isinstance(data, dict):
             candidates.extend([data.get("message"), data.get("text")])
 
+        item = self._extract_event_item(event)
+        if isinstance(item, dict):
+            candidates.extend([item.get("message"), item.get("text"), self._extract_summary_text(item)])
+
         for value in candidates:
             if isinstance(value, str):
                 stripped = value.strip()
                 if stripped:
                     return stripped
         return None
+
+    def _extract_command_from_arguments_text(self, text: str) -> str | None:
+        """Parse tool-call arguments and extract command text when encoded as JSON.
+
+        Args:
+            text: Raw arguments or command string from event payload.
+
+        Returns:
+            Extracted command text when the payload encodes one.
+        """
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            for key in ("command", "cmd"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return None
+
+    def _extract_summary_text(self, item: dict[str, Any]) -> str | None:
+        """Extract short summary text from nested item payload.
+
+        Args:
+            item: Nested stream item payload.
+
+        Returns:
+            Summary text when provided by the event.
+        """
+        summary = item.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return summary.strip()
+        if not isinstance(summary, list):
+            return None
+
+        parts: list[str] = []
+        for value in summary:
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+                continue
+            if isinstance(value, dict):
+                text = value.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        if not parts:
+            return None
+        return " ".join(parts)
 
     def _truncate_for_feishu(self, value: str, limit: int = 180) -> str:
         """Truncate long event fragments for concise Feishu display."""
